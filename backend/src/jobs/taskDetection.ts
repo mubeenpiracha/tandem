@@ -6,7 +6,7 @@
  * to user confirmation via DM.
  */
 
-import { taskDetectionQueue } from '../services/redis';
+import { getTaskDetectionQueue } from '../services/redis';
 import { detectTasksFromMessage } from '../services/ai/taskDetector';
 import { sendTaskConfirmation } from '../services/slack/dmSender';
 import { createSlackMessage, updateSlackMessage, isMessageProcessed } from '../models/slackMessage';
@@ -241,14 +241,14 @@ export async function startTaskDetectionWorker(): Promise<void> {
   // Process jobs continuously
   setInterval(async () => {
     try {
-      const job = await taskDetectionQueue.getNextJob();
+      const job = await getTaskDetectionQueue().getNextJob();
       if (job) {
         const result = await processTaskDetection(job.data);
         
         if (result.errors && result.errors.length > 0) {
-          await taskDetectionQueue.failJob(job.id, result.errors.join('; '));
+          await getTaskDetectionQueue().failJob(job.id, result.errors.join('; '));
         } else {
-          await taskDetectionQueue.completeJob(job.id, result);
+          await getTaskDetectionQueue().completeJob(job.id, result);
         }
       }
     } catch (error) {
@@ -264,7 +264,7 @@ export async function startTaskDetectionWorker(): Promise<void> {
  */
 export async function addTaskDetectionJob(data: TaskDetectionJobData): Promise<string> {
   try {
-    const jobId = await taskDetectionQueue.addJob('detect-tasks', data);
+    const jobId = await getTaskDetectionQueue().addJob('detect-tasks', data);
     console.log(`📋 Added task detection job ${jobId} for message ${data.messageId}`);
     return jobId;
   } catch (error) {
@@ -278,7 +278,7 @@ export async function addTaskDetectionJob(data: TaskDetectionJobData): Promise<s
  */
 export async function getTaskDetectionStats() {
   try {
-    return await taskDetectionQueue.getStats();
+    return await getTaskDetectionQueue().getStats();
   } catch (error) {
     console.error('Failed to get task detection stats:', error);
     return {

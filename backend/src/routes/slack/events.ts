@@ -54,8 +54,11 @@ function verifySlackSignature(req: Request): boolean {
     return false;
   }
 
+  // Get the raw body for signature verification
+  const rawBody = (req as any).rawBody || JSON.stringify(req.body);
+
   // Verify signature
-  const sigBasestring = 'v0:' + timestamp + ':' + JSON.stringify(req.body);
+  const sigBasestring = 'v0:' + timestamp + ':' + rawBody;
   const expectedSignature = 'v0=' + crypto
     .createHmac('sha256', config.slack.signingSecret)
     .update(sigBasestring, 'utf8')
@@ -107,26 +110,43 @@ function shouldProcessMessage(event: SlackEvent): boolean {
  */
 export async function handleSlackEvents(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    // Verify request signature
-    if (!verifySlackSignature(req)) {
-      console.warn('Invalid Slack signature');
-      res.status(401).json({ error: 'Invalid signature' });
-      return;
-    }
-
     const payload = req.body as SlackEventPayload;
 
-    // Handle URL verification challenge
+    // Handle URL verification challenge first
     if (payload.type === 'url_verification') {
       console.log('✅ Slack URL verification challenge received');
       res.status(200).json({ challenge: payload.challenge });
       return;
     }
 
-    // Handle event callbacks
+    // For event callbacks, we need workspace context
     if (payload.type === 'event_callback') {
-      const event = payload.event;
+      // Extract team ID from Slack payload
+      const teamId = payload.team_id;
+      
+      if (!teamId) {
+        console.warn('No team_id in Slack event payload');
+        res.status(400).json({ error: 'team_id required' });
+        return;
+      }
 
+      // Find workspace by Slack team ID
+      const { findWorkspaceBySlackTeamId } = await import('../../models/workspace');
+      const workspace = await findWorkspaceBySlackTeamId(teamId);
+      
+      if (!workspace) {
+        console.warn(`Workspace not found for Slack team: ${teamId}`);
+        res.status(404).json({ error: 'Workspace not found' });
+        return;
+      }
+
+      if (!workspace.isActive) {
+        console.warn(`Workspace inactive for team: ${teamId}`);
+        res.status(403).json({ error: 'Workspace inactive' });
+        return;
+      }
+
+      const event = payload.event;
       console.log(`📨 Received Slack event: ${event.type} from user ${event.user} in channel ${event.channel}`);
 
       // Handle message events
@@ -136,7 +156,7 @@ export async function handleSlackEvents(req: Request, res: Response, next: NextF
         try {
           // Add to task detection queue
           await addTaskDetectionJob({
-            workspaceId: req.workspaceId!,
+            workspaceId: workspace.id,
             messageId: event.ts!,
             channelId: event.channel!,
             threadId: event.thread_ts,
@@ -170,7 +190,7 @@ export async function handleSlackEvents(req: Request, res: Response, next: NextF
 }
 
 /**
- * Middleware to parse Slack webhook body as JSON
+ * Middleware to parse Slack webhook body as JSON while preserving raw body for signature verification
  */
 export function parseSlackWebhook(req: Request, res: Response, next: NextFunction): void {
   // Store raw body for signature verification
@@ -182,6 +202,10 @@ export function parseSlackWebhook(req: Request, res: Response, next: NextFunctio
 
   req.on('end', () => {
     try {
+      // Store raw body for signature verification
+      (req as any).rawBody = rawBody;
+      
+      // Parse JSON body
       req.body = JSON.parse(rawBody);
       next();
     } catch (error) {

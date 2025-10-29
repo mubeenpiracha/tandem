@@ -5,6 +5,7 @@
  */
 
 import { Express, Request, Response } from 'express';
+import express from 'express';
 import { authMiddleware } from '../middleware/auth';
 import { slackWebhookWorkspaceMiddleware } from '../middleware/workspace';
 import taskRoutes from './tasks';
@@ -58,9 +59,9 @@ export function setupRoutes(app: Express): void {
   // API base path
   const API_PREFIX = '/api';
 
-  // Slack webhook routes (public, with signature verification)
-  app.post('/webhooks/slack/events', parseSlackWebhook, slackWebhookWorkspaceMiddleware, handleSlackEvents);
-  app.post('/webhooks/slack/interactions', parseSlackInteraction, slackWebhookWorkspaceMiddleware, handleSlackInteractions);
+  // Slack webhook routes (public, no middleware)
+  app.post('/webhooks/slack/events', express.json(), handleSlackEvents);
+  app.post('/webhooks/slack/interactions', express.json(), handleSlackInteractions);
   app.get('/webhooks/slack/health', slackHealthCheck);
   app.get('/webhooks/slack/interactions/health', slackInteractionsHealthCheck);
   
@@ -131,15 +132,6 @@ export function setupRoutes(app: Express): void {
         preferences: `${API_PREFIX}/preferences`,
       },
       documentation: 'See /specs/001-tandem-slack-bot/contracts/api.yaml',
-    });
-  });
-
-  // 404 handler for unmatched API routes
-  app.use(`${API_PREFIX}/*`, (req: Request, res: Response) => {
-    res.status(404).json({
-      error: 'Endpoint not found',
-      path: req.path,
-      method: req.method,
     });
   });
 

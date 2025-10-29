@@ -5,6 +5,7 @@
  * routes, and error handling for the Tandem Slack Bot.
  */
 
+/// <reference path="./types/express.d.ts" />
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';

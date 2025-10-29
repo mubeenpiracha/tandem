@@ -102,8 +102,16 @@ export async function slackWebhookWorkspaceMiddleware(
   next: NextFunction
 ): Promise<void> {
   try {
+    const payload = req.body;
+
+    // Skip workspace validation for URL verification challenges
+    if (payload?.type === 'url_verification') {
+      next();
+      return;
+    }
+
     // Extract team ID from Slack payload
-    const teamId = req.body?.team_id || req.body?.team?.id || req.body?.event?.team;
+    const teamId = payload?.team_id || payload?.team?.id || payload?.event?.team;
     
     if (!teamId) {
       throw new AuthenticationError('Slack team ID not found in payload');

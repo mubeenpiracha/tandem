@@ -266,8 +266,36 @@ export class JobQueue {
   }
 }
 
-// Pre-defined job queues
-export const taskDetectionQueue = new JobQueue('task-detection');
-export const calendarSchedulingQueue = new JobQueue('calendar-scheduling');
-export const notificationQueue = new JobQueue('notifications');
-export const tokenRefreshQueue = new JobQueue('token-refresh');
+// Pre-defined job queues (lazy initialization)
+let taskDetectionQueue: JobQueue;
+let calendarSchedulingQueue: JobQueue;
+let notificationQueue: JobQueue;
+let tokenRefreshQueue: JobQueue;
+
+export function getTaskDetectionQueue(): JobQueue {
+  if (!taskDetectionQueue) {
+    taskDetectionQueue = new JobQueue('task-detection');
+  }
+  return taskDetectionQueue;
+}
+
+export function getCalendarSchedulingQueue(): JobQueue {
+  if (!calendarSchedulingQueue) {
+    calendarSchedulingQueue = new JobQueue('calendar-scheduling');
+  }
+  return calendarSchedulingQueue;
+}
+
+export function getNotificationQueue(): JobQueue {
+  if (!notificationQueue) {
+    notificationQueue = new JobQueue('notifications');
+  }
+  return notificationQueue;
+}
+
+export function getTokenRefreshQueue(): JobQueue {
+  if (!tokenRefreshQueue) {
+    tokenRefreshQueue = new JobQueue('token-refresh');
+  }
+  return tokenRefreshQueue;
+}

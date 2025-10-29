@@ -26,4 +26,16 @@ Node.js 20 LTS (JavaScript/TypeScript for maximum developer accessibility): Foll
 - 001-tandem-slack-bot: Added Node.js 20 LTS (JavaScript/TypeScript for maximum developer accessibility) + Express.js, Prisma ORM, OpenAI SDK, Slack Web API, Google Calendar API
 
 <!-- MANUAL ADDITIONS START -->
+
+## Terminal Usage Guidelines
+
+- Always use `isBackground: true` when running long-running processes like:
+  - `npm run dev` or `npm start`
+  - Development servers
+  - Watch mode commands
+  - `ngrok` tunnels
+  - Any process that doesn't naturally exit
+- This prevents interrupting running services when executing subsequent commands
+
+
 <!-- MANUAL ADDITIONS END -->
