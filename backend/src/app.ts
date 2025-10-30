@@ -8,9 +8,7 @@
 /// <reference path="./types/express.d.ts" />
 import express from 'express';
 import cors from 'cors';
-import helmet from 'helmet';
 import morgan from 'morgan';
-import rateLimit from 'express-rate-limit';
 import { config, validateConfig } from './config';
 import { connectDatabase } from './models';
 import { connectRedis } from './services/redis';
@@ -18,6 +16,8 @@ import { startTaskDetectionWorker } from './jobs/taskDetection';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
 import { setupRoutes } from './routes/index';
+// import { metricsMiddleware } from './routes/monitoring'; // Temporarily disabled
+import { setupSecurity, corsConfiguration, apiRateLimit } from './middleware/security';
 
 // Validate configuration on startup
 validateConfig();
@@ -28,41 +28,14 @@ const app = express();
 // Trust proxy for rate limiting and IP detection
 app.set('trust proxy', 1);
 
-// Security middleware
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
-    },
-  },
-  crossOriginEmbedderPolicy: false,
-}));
+// Enhanced security middleware
+setupSecurity(app);
 
-// CORS configuration
-app.use(cors(config.cors));
+// CORS configuration with workspace isolation
+app.use(cors(corsConfiguration()));
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: config.rateLimit.windowMs,
-  max: config.rateLimit.maxRequests,
-  standardHeaders: config.rateLimit.standardHeaders,
-  legacyHeaders: config.rateLimit.legacyHeaders,
-  message: {
-    error: {
-      code: 'RATE_LIMIT_EXCEEDED',
-      message: 'Too many requests, please try again later.',
-    },
-  },
-  skip: (req) => {
-    // Skip rate limiting for health checks
-    return req.path === '/health' || req.path === '/api/health';
-  },
-});
-
-app.use('/api/', limiter);
+// API rate limiting
+app.use('/api/', apiRateLimit);
 
 // Request logging
 if (config.logging.level === 'debug' || config.isDevelopment) {
@@ -73,6 +46,9 @@ if (config.logging.level === 'debug' || config.isDevelopment) {
 
 // Custom request logging middleware
 app.use(requestLogger);
+
+// Metrics collection middleware
+// app.use(metricsMiddleware); // Temporarily disabled
 
 // Body parsing middleware
 app.use(express.json({ 

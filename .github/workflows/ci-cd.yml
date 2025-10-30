@@ -1,0 +1,537 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '20'
+  POSTGRES_VERSION: '13'
+  REDIS_VERSION: '6'
+
+jobs:
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+
+  # Backend tests and linting
+  backend-test:
+    runs-on: ubuntu-latest
+    name: Backend Tests
+    
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: tandem_test
+          POSTGRES_USER: tandem_test
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:6
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: Setup test environment
+        run: |
+          cd backend
+          cp .env.example .env.test
+          echo "DATABASE_URL=postgresql://tandem_test:test_password@localhost:5432/tandem_test" >> .env.test
+          echo "REDIS_URL=redis://localhost:6379" >> .env.test
+          echo "NODE_ENV=test" >> .env.test
+
+      - name: Run database migrations
+        run: |
+          cd backend
+          npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_test
+
+      - name: Generate Prisma client
+        run: |
+          cd backend
+          npx prisma generate
+
+      - name: Run backend linting
+        run: |
+          cd backend
+          npm run lint
+
+      - name: Run backend tests
+        run: |
+          cd backend
+          npm run test:coverage
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_test
+          REDIS_URL: redis://localhost:6379
+          NODE_ENV: test
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: backend/coverage/lcov.info
+          flags: backend
+          name: backend-coverage
+
+  # Multi-workspace integration tests
+  multi-workspace-test:
+    runs-on: ubuntu-latest
+    name: Multi-Workspace Integration Tests
+    needs: [backend-test]
+    
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: tandem_integration
+          POSTGRES_USER: tandem_test
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:6
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: Setup integration test environment
+        run: |
+          cd backend
+          cp .env.example .env.integration
+          echo "DATABASE_URL=postgresql://tandem_test:test_password@localhost:5432/tandem_integration" >> .env.integration
+          echo "REDIS_URL=redis://localhost:6379" >> .env.integration
+          echo "NODE_ENV=test" >> .env.integration
+
+      - name: Run database migrations
+        run: |
+          cd backend
+          npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_integration
+
+      - name: Create test workspaces
+        run: |
+          cd backend
+          npm run test:integration:setup
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_integration
+
+      - name: Run multi-workspace tests
+        run: |
+          cd backend
+          npm run test:integration:multi-workspace
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_integration
+          REDIS_URL: redis://localhost:6379
+
+  # Frontend tests and build
+  frontend-test:
+    runs-on: ubuntu-latest
+    name: Frontend Tests
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run frontend linting
+        run: |
+          cd frontend
+          npm run lint
+
+      - name: Run frontend tests
+        run: |
+          cd frontend
+          npm run test:coverage
+        env:
+          CI: true
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
+
+      - name: Upload frontend build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-build
+          path: frontend/build/
+
+      - name: Upload frontend coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: frontend/coverage/lcov.info
+          flags: frontend
+          name: frontend-coverage
+
+  # End-to-end tests
+  e2e-test:
+    runs-on: ubuntu-latest
+    name: End-to-End Tests
+    needs: [backend-test, frontend-test]
+    
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: tandem_e2e
+          POSTGRES_USER: tandem_test
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:6
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          cd backend && npm ci
+          cd ../frontend && npm ci
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build
+          path: frontend/build/
+
+      - name: Setup E2E environment
+        run: |
+          cd backend
+          cp .env.example .env.e2e
+          echo "DATABASE_URL=postgresql://tandem_test:test_password@localhost:5432/tandem_e2e" >> .env.e2e
+          echo "REDIS_URL=redis://localhost:6379" >> .env.e2e
+          echo "NODE_ENV=test" >> .env.e2e
+          echo "FRONTEND_URL=http://localhost:3000" >> .env.e2e
+
+      - name: Run database migrations
+        run: |
+          cd backend
+          npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_e2e
+
+      - name: Start backend server
+        run: |
+          cd backend
+          npm start &
+          sleep 10
+        env:
+          DATABASE_URL: postgresql://tandem_test:test_password@localhost:5432/tandem_e2e
+          REDIS_URL: redis://localhost:6379
+          PORT: 3001
+
+      - name: Start frontend server
+        run: |
+          cd frontend
+          npm start &
+          sleep 10
+        env:
+          PORT: 3000
+          REACT_APP_API_URL: http://localhost:3001
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps
+
+      - name: Run E2E tests
+        run: |
+          cd e2e
+          npm ci
+          npm run test
+        env:
+          BASE_URL: http://localhost:3000
+          API_URL: http://localhost:3001
+
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: e2e-test-results
+          path: e2e/test-results/
+
+  # Security audit
+  security-audit:
+    runs-on: ubuntu-latest
+    name: Security Audit
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Audit backend dependencies
+        run: |
+          cd backend
+          npm audit --audit-level moderate
+
+      - name: Audit frontend dependencies
+        run: |
+          cd frontend
+          npm audit --audit-level moderate
+
+      - name: Check for known vulnerabilities
+        run: |
+          npx audit-ci --config audit-ci.json
+
+  # Build and deploy (production)
+  build-deploy:
+    runs-on: ubuntu-latest
+    name: Build and Deploy
+    needs: [security-scan, backend-test, frontend-test, multi-workspace-test, e2e-test, security-audit]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          cd backend && npm ci --production
+          cd ../frontend && npm ci
+
+      - name: Build backend
+        run: |
+          cd backend
+          npm run build
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy
+          cp -r backend/dist deploy/backend
+          cp -r frontend/build deploy/frontend
+          cp backend/package.json deploy/
+          cp backend/package-lock.json deploy/
+          cp -r backend/prisma deploy/
+          tar -czf deployment.tar.gz deploy/
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-package
+          path: deployment.tar.gz
+
+      # Database migration (production)
+      - name: Run production migrations
+        run: |
+          cd backend
+          npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+
+      # Deploy to production (example using Docker)
+      - name: Deploy to production
+        run: |
+          # This would typically deploy to your production infrastructure
+          # Examples: AWS ECS, Google Cloud Run, Kubernetes, etc.
+          echo "Deploying to production..."
+          # docker build -t tandem-app .
+          # docker push ${{ secrets.REGISTRY_URL }}/tandem-app:${{ github.sha }}
+          # kubectl set image deployment/tandem-app tandem-app=${{ secrets.REGISTRY_URL }}/tandem-app:${{ github.sha }}
+
+  # Staging deployment
+  deploy-staging:
+    runs-on: ubuntu-latest
+    name: Deploy to Staging
+    needs: [security-scan, backend-test, frontend-test]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          cd backend && npm ci
+          cd ../frontend && npm ci
+
+      - name: Build applications
+        run: |
+          cd backend && npm run build
+          cd ../frontend && npm run build
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # Staging deployment commands here
+
+  # Performance tests
+  performance-test:
+    runs-on: ubuntu-latest
+    name: Performance Tests
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run load tests
+        run: |
+          # Install k6 or artillery for load testing
+          npm install -g artillery
+          artillery run performance/load-test.yml
+
+      - name: Run workspace isolation performance tests
+        run: |
+          # Test multi-workspace performance
+          artillery run performance/multi-workspace-test.yml
+
+  # Notify on completion
+  notify:
+    runs-on: ubuntu-latest
+    name: Notify Team
+    needs: [build-deploy]
+    if: always()
+    
+    steps:
+      - name: Notify Slack on success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          channel: '#tandem-deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          channel: '#tandem-alerts'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}

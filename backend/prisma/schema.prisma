@@ -126,6 +126,27 @@ model GoogleToken {
   @@map("google_tokens")
 }
 
+model AuditLog {
+  id          String   @id @default(uuid())
+  eventType   String   @map("event_type")
+  userId      String?  @map("user_id")
+  workspaceId String?  @map("workspace_id")
+  ipAddress   String   @map("ip_address")
+  userAgent   String   @map("user_agent")
+  endpoint    String
+  method      String
+  success     Boolean
+  details     String?
+  timestamp   DateTime @default(now())
+  sessionId   String?  @map("session_id")
+  riskLevel   String   @map("risk_level")
+
+  @@index([eventType, timestamp])
+  @@index([workspaceId, timestamp])
+  @@index([userId, timestamp])
+  @@map("audit_logs")
+}
+
 enum UserStatus {
   ACTIVE
   INACTIVE

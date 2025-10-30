@@ -23,7 +23,9 @@ export enum LogCategory {
   DATABASE = 'database',
   WEBHOOK = 'webhook',
   AUTH = 'auth',
+  CALENDAR = 'calendar',
   SYSTEM = 'system',
+  SECURITY = 'security',
 }
 
 // Structured log entry interface
@@ -36,6 +38,8 @@ interface LogEntry {
   userId?: string;
   messageId?: string;
   taskId?: string;
+  workspaceId?: string;
+  workspaceName?: string;
   duration?: number;
   error?: {
     name: string;
@@ -61,6 +65,8 @@ function formatLogEntry(entry: LogEntry): string {
   ];
   
   if (entry.userId) parts.push(`user:${entry.userId}`);
+  if (entry.workspaceId) parts.push(`workspace:${entry.workspaceId}`);
+  if (entry.workspaceName) parts.push(`(${entry.workspaceName})`);
   if (entry.messageId) parts.push(`msg:${entry.messageId}`);
   if (entry.taskId) parts.push(`task:${entry.taskId}`);
   if (entry.duration) parts.push(`${entry.duration}ms`);
@@ -93,6 +99,8 @@ function log(
     userId?: string;
     messageId?: string;
     taskId?: string;
+    workspaceId?: string;
+    workspaceName?: string;
     duration?: number;
     error?: Error;
   }
@@ -148,11 +156,16 @@ function log(
 export const Logger = {
   // Task detection logging
   taskDetection: {
-    started: (messageId: string, userId: string, messageText: string) => {
+    started: (messageId: string, userId: string, messageText: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.TASK_DETECTION, 'Task detection started', {
         messageLength: messageText.length,
         messagePreview: messageText.substring(0, 100),
-      }, { messageId, userId });
+      }, { 
+        messageId, 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
     completed: (messageId: string, userId: string, result: {
@@ -160,74 +173,109 @@ export const Logger = {
       tasksCreated: number;
       processingTime: number;
       confidence?: number;
-    }) => {
+    }, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.TASK_DETECTION, 'Task detection completed', result, { 
         messageId, 
         userId, 
-        duration: result.processingTime 
+        duration: result.processingTime,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
       });
     },
     
-    failed: (messageId: string, userId: string, error: Error, duration: number) => {
+    failed: (messageId: string, userId: string, error: Error, duration: number, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.ERROR, LogCategory.TASK_DETECTION, 'Task detection failed', {}, { 
         messageId, 
         userId, 
         duration, 
-        error 
+        error,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
       });
     },
     
-    aiResponse: (messageId: string, userId: string, response: any, processingTime: number) => {
+    aiResponse: (messageId: string, userId: string, response: any, processingTime: number, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.DEBUG, LogCategory.TASK_DETECTION, 'AI task detection response', {
         isTask: response.isTask,
         confidence: response.confidence,
         taskCount: response.tasks?.length || 0,
         reasoning: response.reasoning,
-      }, { messageId, userId, duration: processingTime });
+      }, { 
+        messageId, 
+        userId, 
+        duration: processingTime,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    taskCreated: (taskId: string, userId: string, taskTitle: string, confidence: number) => {
+    taskCreated: (taskId: string, userId: string, taskTitle: string, confidence: number, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.TASK_DETECTION, 'Task created from detection', {
         title: taskTitle,
         confidence,
-      }, { taskId, userId });
+      }, { 
+        taskId, 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    confirmationSent: (taskId: string, userId: string, messageId: string) => {
+    confirmationSent: (taskId: string, userId: string, messageId: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.TASK_DETECTION, 'Task confirmation sent', {}, { 
         taskId, 
         userId, 
-        messageId 
+        messageId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
       });
     },
   },
   
   // Slack API logging
   slack: {
-    webhookReceived: (eventType: string, userId: string, channelId: string) => {
+    webhookReceived: (eventType: string, userId: string, channelId: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.SLACK_API, 'Slack webhook received', {
         eventType,
         channelId,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    messageSent: (userId: string, channelId: string, messageType: string) => {
+    messageSent: (userId: string, channelId: string, messageType: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.SLACK_API, 'Slack message sent', {
         channelId,
         messageType,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    interactionReceived: (userId: string, actionType: string, taskId?: string) => {
+    interactionReceived: (userId: string, actionType: string, workspaceContext?: { id: string; slackTeamName: string }, taskId?: string) => {
       log(LogLevel.INFO, LogCategory.SLACK_API, 'Slack interaction received', {
         actionType,
-      }, { userId, taskId });
+      }, { 
+        userId, 
+        taskId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    apiError: (userId: string, operation: string, error: Error) => {
+    apiError: (userId: string, operation: string, error: Error, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.ERROR, LogCategory.SLACK_API, `Slack API error: ${operation}`, {
         operation,
-      }, { userId, error });
+      }, { 
+        userId, 
+        error,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
   },
   
@@ -281,68 +329,125 @@ export const Logger = {
   
   // Authentication logging
   auth: {
-    loginAttempt: (userId: string, method: string) => {
+    loginAttempt: (userId: string, method: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'Authentication attempt', {
         method,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    loginSuccess: (userId: string, method: string) => {
+    loginSuccess: (userId: string, method: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'Authentication success', {
         method,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    loginFailure: (userId: string, method: string, reason: string) => {
+    loginFailure: (userId: string, method: string, reason: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.WARN, LogCategory.AUTH, 'Authentication failure', {
         method,
         reason,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    tokenRefresh: (userId: string, service: string) => {
+    tokenRefresh: (userId: string, service: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'Token refreshed', {
         service,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    oauthInitiated: (provider: string, state: string) => {
+    oauthInitiated: (provider: string, state: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'OAuth flow initiated', {
         provider,
         state: state.substring(0, 8) + '...', // Log partial state for security
+      }, {
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
       });
     },
     
-    oauthFailed: (provider: string, error: string) => {
+    oauthFailed: (provider: string, error: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.ERROR, LogCategory.AUTH, 'OAuth flow failed', {
         provider,
         error,
+      }, {
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
       });
     },
     
-    userCreated: (userId: string, provider: string, email: string) => {
+    userCreated: (userId: string, provider: string, email: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'New user created', {
         provider,
         email,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    userUpdated: (userId: string, provider: string) => {
+    userUpdated: (userId: string, provider: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'User updated', {
         provider,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    tokenStored: (userId: string, provider: string) => {
+    tokenStored: (userId: string, provider: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'OAuth token stored', {
         provider,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
     },
     
-    tokenRevoked: (userId: string, provider: string) => {
+    tokenRevoked: (userId: string, provider: string, workspaceContext?: { id: string; slackTeamName: string }) => {
       log(LogLevel.INFO, LogCategory.AUTH, 'OAuth token revoked', {
         provider,
-      }, { userId });
+      }, { 
+        userId,
+        workspaceId: workspaceContext?.id,
+        workspaceName: workspaceContext?.slackTeamName,
+      });
+    },
+    
+    // Workspace-specific auth events
+    workspaceInstalled: (workspaceId: string, slackTeamId: string, slackTeamName: string) => {
+      log(LogLevel.INFO, LogCategory.AUTH, 'Workspace app installed', {
+        slackTeamId,
+      }, { 
+        workspaceId,
+        workspaceName: slackTeamName,
+      });
+    },
+    
+    workspaceUninstalled: (workspaceId: string, slackTeamId: string, slackTeamName: string) => {
+      log(LogLevel.INFO, LogCategory.AUTH, 'Workspace app uninstalled', {
+        slackTeamId,
+      }, { 
+        workspaceId,
+        workspaceName: slackTeamName,
+      });
     },
   },
   
@@ -377,20 +482,36 @@ export const Logger = {
   },
   
   // Generic logging functions
-  error: (category: LogCategory, message: string, error: Error, context?: any) => {
-    log(LogLevel.ERROR, category, message, context, { error });
+  error: (category: LogCategory, message: string, error: Error, context?: any, workspaceContext?: { id: string; slackTeamName: string }) => {
+    log(LogLevel.ERROR, category, message, context, { 
+      error,
+      workspaceId: workspaceContext?.id,
+      workspaceName: workspaceContext?.slackTeamName,
+    });
   },
   
-  warn: (category: LogCategory, message: string, data?: any, context?: any) => {
-    log(LogLevel.WARN, category, message, data, context);
+  warn: (category: LogCategory, message: string, data?: any, context?: any, workspaceContext?: { id: string; slackTeamName: string }) => {
+    log(LogLevel.WARN, category, message, data, {
+      ...context,
+      workspaceId: workspaceContext?.id,
+      workspaceName: workspaceContext?.slackTeamName,
+    });
   },
   
-  info: (category: LogCategory, message: string, data?: any, context?: any) => {
-    log(LogLevel.INFO, category, message, data, context);
+  info: (category: LogCategory, message: string, data?: any, context?: any, workspaceContext?: { id: string; slackTeamName: string }) => {
+    log(LogLevel.INFO, category, message, data, {
+      ...context,
+      workspaceId: workspaceContext?.id,
+      workspaceName: workspaceContext?.slackTeamName,
+    });
   },
   
-  debug: (category: LogCategory, message: string, data?: any, context?: any) => {
-    log(LogLevel.DEBUG, category, message, data, context);
+  debug: (category: LogCategory, message: string, data?: any, context?: any, workspaceContext?: { id: string; slackTeamName: string }) => {
+    log(LogLevel.DEBUG, category, message, data, {
+      ...context,
+      workspaceId: workspaceContext?.id,
+      workspaceName: workspaceContext?.slackTeamName,
+    });
   },
 };
 
@@ -402,14 +523,19 @@ export class PerformanceTimer {
   private operation: string;
   private category: LogCategory;
   private context?: any;
+  private workspaceContext?: { id: string; slackTeamName: string };
   
-  constructor(operation: string, category: LogCategory, context?: any) {
+  constructor(operation: string, category: LogCategory, context?: any, workspaceContext?: { id: string; slackTeamName: string }) {
     this.startTime = Date.now();
     this.operation = operation;
     this.category = category;
     this.context = context;
+    this.workspaceContext = workspaceContext;
     
-    log(LogLevel.DEBUG, category, `${operation} started`, context);
+    log(LogLevel.DEBUG, category, `${operation} started`, context, {
+      workspaceId: workspaceContext?.id,
+      workspaceName: workspaceContext?.slackTeamName,
+    });
   }
   
   complete(result?: any): number {
@@ -417,7 +543,11 @@ export class PerformanceTimer {
     log(LogLevel.DEBUG, this.category, `${this.operation} completed`, {
       ...this.context,
       ...result,
-    }, { duration });
+    }, { 
+      duration,
+      workspaceId: this.workspaceContext?.id,
+      workspaceName: this.workspaceContext?.slackTeamName,
+    });
     return duration;
   }
   
@@ -425,7 +555,9 @@ export class PerformanceTimer {
     const duration = Date.now() - this.startTime;
     log(LogLevel.ERROR, this.category, `${this.operation} failed`, this.context, { 
       duration, 
-      error 
+      error,
+      workspaceId: this.workspaceContext?.id,
+      workspaceName: this.workspaceContext?.slackTeamName,
     });
     return duration;
   }
@@ -434,6 +566,6 @@ export class PerformanceTimer {
 /**
  * Create a performance timer for an operation
  */
-export function createTimer(operation: string, category: LogCategory, context?: any): PerformanceTimer {
-  return new PerformanceTimer(operation, category, context);
+export function createTimer(operation: string, category: LogCategory, context?: any, workspaceContext?: { id: string; slackTeamName: string }): PerformanceTimer {
+  return new PerformanceTimer(operation, category, context, workspaceContext);
 }

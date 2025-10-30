@@ -1,0 +1,39 @@
+config:
+  target: "{{ $processEnvironment.API_URL || 'http://localhost:3001' }}"
+  phases:
+    - duration: 60
+      arrivalRate: 20
+      name: "Multi-workspace stress test"
+  defaults:
+    headers:
+      Content-Type: "application/json"
+  processor: "./multi-workspace-processor.js"
+
+scenarios:
+  - name: "Workspace Isolation Test"
+    weight: 40
+    flow:
+      # Create multiple workspace sessions
+      - function: "setupWorkspaces"
+      # Test workspace isolation
+      - loop:
+          - function: "testWorkspaceAccess"
+          - think: 0.5
+        count: 10
+
+  - name: "Cross-Workspace Security Test"
+    weight: 30
+    flow:
+      # Try to access resources across workspaces
+      - function: "setupTwoWorkspaces"
+      - function: "attemptCrossWorkspaceAccess"
+      - think: 1
+
+  - name: "Concurrent Workspace Operations"
+    weight: 30
+    flow:
+      # Simulate multiple users in different workspaces
+      - parallel:
+          - function: "workspaceAOperations"
+          - function: "workspaceBOperations"
+          - function: "workspaceCOperations"

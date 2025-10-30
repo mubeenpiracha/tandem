@@ -24,6 +24,7 @@ declare namespace Express {
      */
     workspace?: {
       id: string;
+      name: string;
       slackTeamId: string;
       slackTeamName: string;
       isActive: boolean;

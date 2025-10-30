@@ -35,6 +35,32 @@ export interface TaskWithRelations extends Task {
 }
 
 /**
+ * Validate task belongs to workspace (through user)
+ */
+export async function validateTaskWorkspace(taskId: string, workspaceId: string): Promise<boolean> {
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    include: { user: true },
+  });
+
+  return task?.user?.workspaceId === workspaceId;
+}
+
+/**
+ * Find task by ID with workspace validation
+ */
+export async function findTaskByIdInWorkspace(id: string, workspaceId: string): Promise<Task | null> {
+  return await prisma.task.findFirst({
+    where: { 
+      id,
+      user: {
+        workspaceId
+      }
+    },
+  });
+}
+
+/**
  * Calculate derived urgency based on due date
  */
 export function calculateDerivedUrgency(dueDate?: Date): TaskUrgency {
@@ -103,17 +129,23 @@ export async function findTaskWithRelations(id: string): Promise<TaskWithRelatio
 }
 
 /**
- * Find tasks by user ID with filtering
+ * Find tasks by user ID with filtering (workspace-scoped)
  */
 export async function findTasksByUser(
   userId: string,
+  workspaceId: string,
   filters?: {
     status?: TaskStatus;
     limit?: number;
     offset?: number;
   }
 ): Promise<{ tasks: Task[]; total: number }> {
-  const where: Prisma.TaskWhereInput = { userId };
+  const where: Prisma.TaskWhereInput = { 
+    userId,
+    user: {
+      workspaceId
+    }
+  };
   if (filters?.status) {
     where.status = filters.status;
   }
@@ -132,10 +164,15 @@ export async function findTasksByUser(
 }
 
 /**
- * Update task data
+ * Update task data (workspace-scoped)
  */
-export async function updateTask(id: string, data: UpdateTaskData): Promise<Task> {
+export async function updateTask(id: string, data: UpdateTaskData, workspaceId?: string): Promise<Task> {
   try {
+    // Validate workspace if provided
+    if (workspaceId && !(await validateTaskWorkspace(id, workspaceId))) {
+      throw new Error('Task not found in workspace');
+    }
+
     const updateData: any = { ...data };
     
     // Recalculate derived urgency if due date changes
@@ -158,13 +195,23 @@ export async function updateTask(id: string, data: UpdateTaskData): Promise<Task
 }
 
 /**
- * Update task status with validation
+ * Update task status with validation (workspace-scoped)
  */
-export async function updateTaskStatus(id: string, status: TaskStatus): Promise<Task> {
-  const task = await findTaskById(id);
-  if (!task) {
-    throw new Error('Task not found');
+export async function updateTaskStatus(id: string, status: TaskStatus, workspaceId?: string): Promise<Task> {
+  // Validate workspace if provided
+  if (workspaceId) {
+    const task = await findTaskByIdInWorkspace(id, workspaceId);
+    if (!task) {
+      throw new Error('Task not found in workspace');
+    }
+  } else {
+    const task = await findTaskById(id);
+    if (!task) {
+      throw new Error('Task not found');
+    }
   }
+
+  const task = workspaceId ? await findTaskByIdInWorkspace(id, workspaceId) : await findTaskById(id);
 
   // Validate status transitions
   const validTransitions: Record<TaskStatus, TaskStatus[]> = {
@@ -175,18 +222,23 @@ export async function updateTaskStatus(id: string, status: TaskStatus): Promise<
     DISMISSED: [], // No transitions from dismissed
   };
 
-  if (!validTransitions[task.status].includes(status)) {
-    throw new Error(`Invalid status transition from ${task.status} to ${status}`);
+  if (!validTransitions[task!.status].includes(status)) {
+    throw new Error(`Invalid status transition from ${task!.status} to ${status}`);
   }
 
-  return await updateTask(id, { status });
+  return await updateTask(id, { status }, workspaceId);
 }
 
 /**
- * Delete task
+ * Delete task (workspace-scoped)
  */
-export async function deleteTask(id: string): Promise<void> {
+export async function deleteTask(id: string, workspaceId?: string): Promise<void> {
   try {
+    // Validate workspace if provided
+    if (workspaceId && !(await validateTaskWorkspace(id, workspaceId))) {
+      throw new Error('Task not found in workspace');
+    }
+
     await prisma.task.delete({
       where: { id },
     });
@@ -201,10 +253,15 @@ export async function deleteTask(id: string): Promise<void> {
 }
 
 /**
- * Get tasks pending confirmation
+ * Get tasks pending confirmation (workspace-scoped)
  */
-export async function getPendingTasks(userId?: string): Promise<Task[]> {
-  const where: Prisma.TaskWhereInput = { status: 'PENDING' };
+export async function getPendingTasks(workspaceId: string, userId?: string): Promise<Task[]> {
+  const where: Prisma.TaskWhereInput = { 
+    status: 'PENDING',
+    user: {
+      workspaceId
+    }
+  };
   if (userId) {
     where.userId = userId;
   }
@@ -216,10 +273,15 @@ export async function getPendingTasks(userId?: string): Promise<Task[]> {
 }
 
 /**
- * Get tasks ready for scheduling
+ * Get tasks ready for scheduling (workspace-scoped)
  */
-export async function getConfirmedTasks(userId?: string): Promise<Task[]> {
-  const where: Prisma.TaskWhereInput = { status: 'CONFIRMED' };
+export async function getConfirmedTasks(workspaceId: string, userId?: string): Promise<Task[]> {
+  const where: Prisma.TaskWhereInput = { 
+    status: 'CONFIRMED',
+    user: {
+      workspaceId
+    }
+  };
   if (userId) {
     where.userId = userId;
   }
@@ -235,13 +297,16 @@ export async function getConfirmedTasks(userId?: string): Promise<Task[]> {
 }
 
 /**
- * Get overdue tasks
+ * Get overdue tasks (workspace-scoped)
  */
-export async function getOverdueTasks(userId?: string): Promise<Task[]> {
+export async function getOverdueTasks(workspaceId: string, userId?: string): Promise<Task[]> {
   const now = new Date();
   const where: Prisma.TaskWhereInput = {
     dueDate: { lt: now },
     status: { in: ['PENDING', 'CONFIRMED', 'SCHEDULED'] },
+    user: {
+      workspaceId
+    }
   };
   if (userId) {
     where.userId = userId;

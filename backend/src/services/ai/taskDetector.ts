@@ -2,11 +2,22 @@
  * AI-powered task detection service using OpenAI
  * 
  * This module provides intelligent task detection from Slack messages
- * using OpenAI's GPT models to identify actionable tasks.
+ * using OpenAI's GPT models to identify actionable tasks with workspace isolation
+ * and performance optimizations.
  */
 
 import OpenAI from 'openai';
 import { config } from '../../config';
+import { Logger, LogCategory } from '../../utils/logger';
+import { createHash } from 'crypto';
+
+// Redis for caching
+let redis: any = null;
+try {
+  redis = require('../redis').client;
+} catch (error) {
+  Logger.error(LogCategory.SYSTEM, 'Redis not available for AI caching', error as Error);
+}
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -28,7 +39,41 @@ export interface TaskDetectionResult {
   confidence: number;
   tasks: DetectedTask[];
   reasoning?: string;
+  cached?: boolean;
+  processingTime?: number;
 }
+
+// Performance metrics interface
+export interface AIPerformanceMetrics {
+  requestCount: number;
+  cacheHitRate: number;
+  averageResponseTime: number;
+  errorRate: number;
+  workspaceRequestCounts: Record<string, number>;
+}
+
+// Global performance tracking
+const performanceMetrics: AIPerformanceMetrics = {
+  requestCount: 0,
+  cacheHitRate: 0,
+  averageResponseTime: 0,
+  errorRate: 0,
+  workspaceRequestCounts: {},
+};
+
+// Request batching for workspace isolation
+const workspaceBatches = new Map<string, Array<{
+  resolve: (value: TaskDetectionResult) => void;
+  reject: (error: Error) => void;
+  messageText: string;
+  channelContext?: string;
+  userContext?: string;
+  requestId: string;
+}>>();
+
+// Batch processing timeout
+const BATCH_TIMEOUT = 2000; // 2 seconds
+const MAX_BATCH_SIZE = 5; // Maximum messages per batch
 
 // System prompt for task detection
 const TASK_DETECTION_PROMPT = `You are an expert assistant that identifies actionable tasks from Slack messages. Analyze the message and determine if it contains any actionable tasks.
@@ -65,46 +110,81 @@ GUIDELINES:
 - Confidence should reflect certainty of task identification`;
 
 /**
- * Detect tasks from a Slack message using OpenAI
+ * Optimized task detection with caching and workspace isolation
  */
 export async function detectTasksFromMessage(
   messageText: string,
+  workspaceId: string,
   channelContext?: string,
   userContext?: string
 ): Promise<TaskDetectionResult> {
+  const startTime = Date.now();
+  const requestId = generateRequestId(messageText, workspaceId);
+  
   try {
-    // Prepare the message for analysis
-    const context = buildContextualPrompt(messageText, channelContext, userContext);
+    // Update metrics
+    performanceMetrics.requestCount++;
+    performanceMetrics.workspaceRequestCounts[workspaceId] = 
+      (performanceMetrics.workspaceRequestCounts[workspaceId] || 0) + 1;
 
-    const completion = await openai.chat.completions.create({
-      model: config.openai.model,
-      messages: [
-        {
-          role: 'system',
-          content: TASK_DETECTION_PROMPT,
-        },
-        {
-          role: 'user',
-          content: context,
-        },
-      ],
-      max_tokens: config.openai.maxTokens,
-      temperature: config.openai.temperature,
-      response_format: { type: 'json_object' },
+    Logger.info(LogCategory.SYSTEM, `Starting task detection for workspace ${workspaceId}`, {
+      requestId,
+      messageLength: messageText.length,
     });
 
-    const response = completion.choices[0]?.message?.content;
-    if (!response) {
-      throw new Error('No response from OpenAI');
+    // Try cache first
+    const cacheKey = generateCacheKey(messageText, channelContext, userContext);
+    const cachedResult = await getCachedResult(cacheKey);
+    
+    if (cachedResult) {
+      Logger.info(LogCategory.SYSTEM, `Cache hit for request ${requestId}`);
+      performanceMetrics.cacheHitRate = 
+        (performanceMetrics.cacheHitRate * (performanceMetrics.requestCount - 1) + 1) / performanceMetrics.requestCount;
+      
+      return {
+        ...cachedResult,
+        cached: true,
+        processingTime: Date.now() - startTime,
+      };
     }
 
-    // Parse and validate the response
-    const result = JSON.parse(response) as TaskDetectionResult;
-    
-    // Validate and sanitize the result
-    return validateAndSanitizeResult(result);
+    // Use batching for workspace isolation
+    const result = await processBatchedRequest(
+      messageText,
+      workspaceId,
+      channelContext,
+      userContext,
+      requestId
+    );
+
+    // Cache the result
+    await cacheResult(cacheKey, result);
+
+    // Update metrics
+    const processingTime = Date.now() - startTime;
+    performanceMetrics.averageResponseTime = 
+      (performanceMetrics.averageResponseTime * (performanceMetrics.requestCount - 1) + processingTime) / performanceMetrics.requestCount;
+
+    Logger.info(LogCategory.SYSTEM, `Task detection completed for workspace ${workspaceId}`, {
+      requestId,
+      processingTime,
+      tasksFound: result.tasks.length,
+      confidence: result.confidence,
+    });
+
+    return {
+      ...result,
+      cached: false,
+      processingTime,
+    };
   } catch (error) {
-    console.error('Task detection failed:', error);
+    performanceMetrics.errorRate = 
+      (performanceMetrics.errorRate * (performanceMetrics.requestCount - 1) + 1) / performanceMetrics.requestCount;
+
+    Logger.error(LogCategory.SYSTEM, `Task detection failed for workspace ${workspaceId}`, error as Error, {
+      requestId,
+      messageLength: messageText.length,
+    });
     
     // Return safe fallback result
     return {
@@ -112,8 +192,217 @@ export async function detectTasksFromMessage(
       confidence: 0,
       tasks: [],
       reasoning: `Error during analysis: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      cached: false,
+      processingTime: Date.now() - startTime,
     };
   }
+}
+
+/**
+ * Process batched requests for workspace isolation
+ */
+async function processBatchedRequest(
+  messageText: string,
+  workspaceId: string,
+  channelContext?: string,
+  userContext?: string,
+  requestId?: string
+): Promise<TaskDetectionResult> {
+  return new Promise((resolve, reject) => {
+    // Get or create batch for workspace
+    let batch = workspaceBatches.get(workspaceId);
+    if (!batch) {
+      batch = [];
+      workspaceBatches.set(workspaceId, batch);
+    }
+
+    // Add request to batch
+    batch.push({
+      resolve,
+      reject,
+      messageText,
+      channelContext,
+      userContext,
+      requestId: requestId || 'unknown',
+    });
+
+    // Process batch if it's full or after timeout
+    if (batch.length >= MAX_BATCH_SIZE) {
+      processBatch(workspaceId);
+    } else if (batch.length === 1) {
+      // Set timeout for first request in batch
+      setTimeout(() => processBatch(workspaceId), BATCH_TIMEOUT);
+    }
+  });
+}
+
+/**
+ * Process a batch of requests for a workspace
+ */
+async function processBatch(workspaceId: string): Promise<void> {
+  const batch = workspaceBatches.get(workspaceId);
+  if (!batch || batch.length === 0) return;
+
+  // Clear the batch
+  workspaceBatches.delete(workspaceId);
+
+  Logger.info(LogCategory.SYSTEM, `Processing batch for workspace ${workspaceId}`, {
+    batchSize: batch.length,
+  });
+
+  try {
+    // Process requests in parallel but rate-limited
+    const results = await Promise.allSettled(
+      batch.map(request => 
+        processIndividualRequest(
+          request.messageText,
+          request.channelContext,
+          request.userContext
+        )
+      )
+    );
+
+    // Resolve each request with its result
+    results.forEach((result, index) => {
+      const request = batch[index];
+      if (result.status === 'fulfilled') {
+        request.resolve(result.value);
+      } else {
+        request.reject(new Error(`Batch processing failed: ${result.reason}`));
+      }
+    });
+  } catch (error) {
+    // Reject all requests in batch
+    batch.forEach(request => {
+      request.reject(error as Error);
+    });
+  }
+}
+
+/**
+ * Process individual request (original logic)
+ */
+async function processIndividualRequest(
+  messageText: string,
+  channelContext?: string,
+  userContext?: string
+): Promise<TaskDetectionResult> {
+  // Prepare the message for analysis
+  const context = buildContextualPrompt(messageText, channelContext, userContext);
+
+  const completion = await openai.chat.completions.create({
+    model: config.openai.model,
+    messages: [
+      {
+        role: 'system',
+        content: TASK_DETECTION_PROMPT,
+      },
+      {
+        role: 'user',
+        content: context,
+      },
+    ],
+    max_tokens: config.openai.maxTokens,
+    temperature: config.openai.temperature,
+    response_format: { type: 'json_object' },
+  });
+
+  const response = completion.choices[0]?.message?.content;
+  if (!response) {
+    throw new Error('No response from OpenAI');
+  }
+
+  // Parse and validate the response
+  const result = JSON.parse(response) as TaskDetectionResult;
+  
+  // Validate and sanitize the result
+  return validateAndSanitizeResult(result);
+}
+
+/**
+ * Generate cache key for request
+ */
+function generateCacheKey(
+  messageText: string,
+  channelContext?: string,
+  userContext?: string
+): string {
+  const content = `${messageText}|${channelContext || ''}|${userContext || ''}`;
+  return `task_detection:${createHash('sha256').update(content).digest('hex')}`;
+}
+
+/**
+ * Generate request ID for tracking
+ */
+function generateRequestId(messageText: string, workspaceId: string): string {
+  const hash = createHash('md5').update(`${messageText}_${workspaceId}_${Date.now()}`).digest('hex');
+  return hash.substring(0, 8);
+}
+
+/**
+ * Get cached result
+ */
+async function getCachedResult(cacheKey: string): Promise<TaskDetectionResult | null> {
+  if (!redis) return null;
+
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+  } catch (error) {
+    Logger.error(LogCategory.SYSTEM, 'Cache read failed', error as Error);
+  }
+  
+  return null;
+}
+
+/**
+ * Cache result with TTL
+ */
+async function cacheResult(cacheKey: string, result: TaskDetectionResult): Promise<void> {
+  if (!redis) return;
+
+  try {
+    // Cache for 1 hour
+    await redis.setex(cacheKey, 3600, JSON.stringify(result));
+  } catch (error) {
+    Logger.error(LogCategory.SYSTEM, 'Cache write failed', error as Error);
+  }
+}
+
+/**
+ * Get performance metrics
+ */
+export function getPerformanceMetrics(): AIPerformanceMetrics {
+  return { ...performanceMetrics };
+}
+
+/**
+ * Reset performance metrics
+ */
+export function resetPerformanceMetrics(): void {
+  performanceMetrics.requestCount = 0;
+  performanceMetrics.cacheHitRate = 0;
+  performanceMetrics.averageResponseTime = 0;
+  performanceMetrics.errorRate = 0;
+  performanceMetrics.workspaceRequestCounts = {};
+}
+
+/**
+ * Get workspace-specific metrics
+ */
+export function getWorkspaceMetrics(workspaceId: string): {
+  requestCount: number;
+  percentageOfTotal: number;
+} {
+  const workspaceCount = performanceMetrics.workspaceRequestCounts[workspaceId] || 0;
+  const totalCount = performanceMetrics.requestCount || 1;
+  
+  return {
+    requestCount: workspaceCount,
+    percentageOfTotal: (workspaceCount / totalCount) * 100,
+  };
 }
 
 /**
@@ -268,14 +557,49 @@ export async function checkOpenAIHealth(): Promise<boolean> {
 }
 
 /**
- * Get AI service statistics
+ * Get comprehensive AI service statistics
  */
 export async function getAIServiceStats() {
+  const isHealthy = await checkOpenAIHealth();
+  const metrics = getPerformanceMetrics();
+  
   return {
+    // Configuration
     model: config.openai.model,
     maxTokens: config.openai.maxTokens,
     temperature: config.openai.temperature,
     confidenceThreshold: config.taskDetection.confidenceThreshold,
-    available: await checkOpenAIHealth(),
+    
+    // Health
+    available: isHealthy,
+    
+    // Performance metrics
+    performance: {
+      totalRequests: metrics.requestCount,
+      cacheHitRate: `${(metrics.cacheHitRate * 100).toFixed(2)}%`,
+      averageResponseTime: `${metrics.averageResponseTime.toFixed(0)}ms`,
+      errorRate: `${(metrics.errorRate * 100).toFixed(2)}%`,
+    },
+    
+    // Workspace distribution
+    workspaceDistribution: Object.entries(metrics.workspaceRequestCounts)
+      .map(([workspaceId, count]) => ({
+        workspaceId,
+        requestCount: count,
+        percentage: `${((count / metrics.requestCount) * 100).toFixed(1)}%`,
+      }))
+      .sort((a, b) => b.requestCount - a.requestCount),
+    
+    // System status
+    caching: {
+      enabled: redis !== null,
+      status: redis ? 'Available' : 'Disabled',
+    },
+    
+    batching: {
+      maxBatchSize: MAX_BATCH_SIZE,
+      batchTimeout: `${BATCH_TIMEOUT}ms`,
+      activeBatches: workspaceBatches.size,
+    },
   };
 }

@@ -1,21 +1,29 @@
 /**
- * User onboarding flow routes
+ * User onboarding flow routes with workspace context
  * 
- * This module handles the complete user onboarding process,
+ * This module handles the complete user onboarding process within workspace context,
  * including account setup and service connections.
  */
 
-import { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { findUserById, createUser } from '../../models/user';
+import { findWorkspaceById } from '../../models/workspace';
 import { getUserAuthStatus } from '../../services/oauth/token_manager';
-import { authMiddleware, optionalAuthMiddleware } from '../../middleware/auth';
+import { authMiddleware, optionalAuthMiddleware, requireWorkspaceAuth } from '../../middleware/auth';
 import { config } from '../../config';
 import { Logger } from '../../utils/logger';
+import { validate } from '../../utils/validation';
+import { z } from 'zod';
 
-// Onboarding status interface
+// Validation schemas
+const onboardingQuerySchema = z.object({
+  workspace: z.string().uuid().optional(),
+});
+
+// Enhanced onboarding status interface with workspace context
 export interface OnboardingStatus {
   isComplete: boolean;
-  currentStep: 'registration' | 'slack_auth' | 'google_auth' | 'completed';
+  currentStep: 'workspace_setup' | 'slack_auth' | 'google_auth' | 'completed';
   completedSteps: string[];
   nextStep: {
     name: string;
@@ -26,6 +34,17 @@ export interface OnboardingStatus {
     id: string;
     email: string;
     slackUserId: string;
+    workspace: {
+      id: string;
+      name: string;
+      teamId: string;
+    };
+  };
+  workspace?: {
+    id: string;
+    name: string;
+    teamId: string;
+    userCount: number;
   };
   authStatus?: {
     slack: { connected: boolean; isValid: boolean };
@@ -34,33 +53,69 @@ export interface OnboardingStatus {
 }
 
 /**
- * Get user onboarding status
+ * Get user onboarding status with workspace context
  */
-export async function getOnboardingStatus(req: Request, res: Response): Promise<void> {
+export async function getOnboardingStatus(req: Request, res: Response, next: NextFunction) {
   try {
+    const queryValidation = validate(onboardingQuerySchema, req.query);
+    if (!queryValidation.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid query parameters',
+        details: queryValidation.errors,
+      });
+    }
+
+    const { workspace: workspaceId } = queryValidation.data || {};
+
     // Use optional auth to handle both authenticated and unauthenticated users
     await optionalAuthMiddleware(req, res, () => {});
 
     if (!req.user) {
-      // User not authenticated - start with registration
+      // User not authenticated - first they need to be part of a workspace
       const status: OnboardingStatus = {
         isComplete: false,
-        currentStep: 'registration',
+        currentStep: 'workspace_setup',
         completedSteps: [],
         nextStep: {
-          name: 'Sign Up with Slack',
-          url: '/api/auth/slack',
-          description: 'Connect your Slack account to get started',
+          name: 'Join Slack Workspace',
+          url: '/auth/slack/workspace/install', // App installation first
+          description: 'The Tandem app needs to be installed in your Slack workspace first',
         },
       };
 
-      res.json(status);
-      return;
+      return res.json({
+        success: true,
+        onboarding: status,
+      });
     }
+
+    // Get user's workspace context
+    const user = await findUserById(req.user.id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    const workspace = await findWorkspaceById(user.workspaceId);
+    if (!workspace) {
+      return res.status(400).json({
+        success: false,
+        error: 'User workspace not found',
+        message: 'Please contact your workspace admin to reinstall the Tandem app',
+      });
+    }
+
+    const workspaceContext = {
+      id: workspace.id,
+      slackTeamName: workspace.slackTeamName,
+    };
 
     // User is authenticated - check their service connections
     const authStatus = await getUserAuthStatus(req.user.id);
-    const completedSteps = ['registration'];
+    const completedSteps = ['workspace_setup']; // Workspace exists if user exists
 
     if (authStatus.slack.connected && authStatus.slack.isValid) {
       completedSteps.push('slack_auth');
@@ -78,19 +133,23 @@ export async function getOnboardingStatus(req: Request, res: Response): Promise<
       currentStep = 'slack_auth';
       nextStep = {
         name: 'Connect Slack',
-        url: '/api/auth/slack',
+        url: `/auth/slack/login?workspace=${workspace.id}`,
         description: 'Connect your Slack account to detect tasks from conversations',
       };
     } else if (!authStatus.google.isValid) {
       currentStep = 'google_auth';
       nextStep = {
         name: 'Connect Google Calendar',
-        url: '/api/auth/google',
+        url: `/auth/google/login?workspace=${workspace.id}`,
         description: 'Connect your Google Calendar to automatically schedule tasks',
       };
     }
 
     const isComplete = authStatus.slack.isValid && authStatus.google.isValid;
+
+    // Get workspace user count
+    const { getUserCountByWorkspace } = await import('../../models/user');
+    const userCount = await getUserCountByWorkspace(workspace.id);
 
     const status: OnboardingStatus = {
       isComplete,
@@ -101,6 +160,17 @@ export async function getOnboardingStatus(req: Request, res: Response): Promise<
         id: req.user.id,
         email: req.user.email,
         slackUserId: req.user.slackUserId,
+        workspace: {
+          id: workspace.id,
+          name: workspace.slackTeamName,
+          teamId: workspace.slackTeamId,
+        },
+      },
+      workspace: {
+        id: workspace.id,
+        name: workspace.slackTeamName,
+        teamId: workspace.slackTeamId,
+        userCount,
       },
       authStatus: {
         slack: {
@@ -114,46 +184,61 @@ export async function getOnboardingStatus(req: Request, res: Response): Promise<
       },
     };
 
-    res.json(status);
+    res.json({
+      success: true,
+      onboarding: status,
+    });
 
   } catch (error) {
     console.error('Failed to get onboarding status:', error);
-    res.status(500).json({
-      error: 'Failed to get onboarding status',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Complete onboarding setup
+ * Complete onboarding setup within workspace context
  */
-export async function completeOnboarding(req: Request, res: Response): Promise<void> {
+export async function completeOnboarding(req: Request, res: Response, next: NextFunction) {
   try {
-    if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+    if (!req.user || !req.workspace) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication and workspace context required' 
+      });
     }
+
+    const workspaceContext = {
+      id: req.workspace.id,
+      slackTeamName: req.workspace.slackTeamName,
+    };
 
     // Verify that all required connections are in place
     const authStatus = await getUserAuthStatus(req.user.id);
     
     if (!authStatus.slack.isValid) {
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'Incomplete onboarding',
         message: 'Slack connection required',
         missingStep: 'slack_auth',
+        nextAction: {
+          name: 'Connect Slack',
+          url: `/auth/slack/login?workspace=${req.workspace.id}`,
+        },
       });
-      return;
     }
 
     if (!authStatus.google.isValid) {
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'Incomplete onboarding',
         message: 'Google Calendar connection required',
         missingStep: 'google_auth',
+        nextAction: {
+          name: 'Connect Google Calendar',
+          url: `/auth/google/login?workspace=${req.workspace.id}`,
+        },
       });
-      return;
     }
 
     // Send welcome message via Slack DM
@@ -165,7 +250,19 @@ export async function completeOnboarding(req: Request, res: Response): Promise<v
       // Don't fail onboarding if welcome message fails
     }
 
-    Logger.auth.userUpdated(req.user.id, 'onboarding_completed');
+    // Initialize default work preferences
+    try {
+      const { initializeUserPreferences } = await import('../../services/preferences/preferences_manager');
+      const user = await findUserById(req.user.id);
+      const userTimezone = user?.timezone || 'UTC';
+      await initializeUserPreferences(req.user.id, req.workspace.id, userTimezone);
+      Logger.auth.userUpdated(req.user.id, 'preferences_initialized', workspaceContext);
+    } catch (error) {
+      console.error('Failed to initialize user preferences:', error);
+      // Don't fail onboarding if preferences initialization fails
+    }
+
+    Logger.auth.userUpdated(req.user.id, 'onboarding_completed', workspaceContext);
 
     res.json({
       success: true,
@@ -174,6 +271,11 @@ export async function completeOnboarding(req: Request, res: Response): Promise<v
         id: req.user.id,
         email: req.user.email,
         slackUserId: req.user.slackUserId,
+        workspace: {
+          id: req.workspace.id,
+          name: req.workspace.name,
+          teamId: req.workspace.slackTeamId,
+        },
       },
       nextSteps: [
         'Start having conversations in Slack channels where you\'re mentioned',
@@ -185,31 +287,35 @@ export async function completeOnboarding(req: Request, res: Response): Promise<v
 
   } catch (error) {
     console.error('Failed to complete onboarding:', error);
-    res.status(500).json({
-      error: 'Failed to complete onboarding',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Reset onboarding for testing or troubleshooting
+ * Reset onboarding for testing or troubleshooting (development only)
  */
-export async function resetOnboarding(req: Request, res: Response): Promise<void> {
+export async function resetOnboarding(req: Request, res: Response, next: NextFunction) {
   try {
-    if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+    if (!req.user || !req.workspace) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication and workspace context required' 
+      });
     }
 
     // Only allow in development environment
     if (config.isProduction) {
-      res.status(403).json({ 
+      return res.status(403).json({ 
+        success: false,
         error: 'Operation not allowed in production',
         message: 'Onboarding reset is only available in development mode',
       });
-      return;
     }
+
+    const workspaceContext = {
+      id: req.workspace.id,
+      slackTeamName: req.workspace.slackTeamName,
+    };
 
     // Remove OAuth tokens
     try {
@@ -226,44 +332,69 @@ export async function resetOnboarding(req: Request, res: Response): Promise<void
       // Token might not exist, that's ok
     }
 
-    Logger.auth.userUpdated(req.user.id, 'onboarding_reset');
+    Logger.auth.userUpdated(req.user.id, 'onboarding_reset', workspaceContext);
 
     res.json({
       success: true,
       message: 'Onboarding reset successfully',
       nextStep: {
         name: 'Connect Slack',
-        url: '/api/auth/slack',
+        url: `/auth/slack/login?workspace=${req.workspace.id}`,
         description: 'Start the onboarding process again',
       },
     });
 
   } catch (error) {
     console.error('Failed to reset onboarding:', error);
-    res.status(500).json({
-      error: 'Failed to reset onboarding',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
  * Get onboarding progress for a specific user (admin only)
  */
-export async function getUserOnboardingProgress(req: Request, res: Response): Promise<void> {
+export async function getUserOnboardingProgress(req: Request, res: Response, next: NextFunction) {
   try {
     const { userId } = req.params;
 
     if (!userId) {
-      res.status(400).json({ error: 'User ID required' });
-      return;
+      return res.status(400).json({ 
+        success: false,
+        error: 'User ID required' 
+      });
     }
 
-    // Find the user
+    if (!req.user || !req.workspace) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication and workspace context required' 
+      });
+    }
+
+    // TODO: Add admin check - for now, users can only see their own progress
+    if (req.user.id !== userId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'You can only view your own onboarding progress',
+      });
+    }
+
+    // Find the user and ensure they're in the same workspace
     const user = await findUserById(userId);
     if (!user) {
-      res.status(404).json({ error: 'User not found' });
-      return;
+      return res.status(404).json({ 
+        success: false,
+        error: 'User not found' 
+      });
+    }
+
+    if (user.workspaceId !== req.workspace.id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        message: 'User belongs to a different workspace',
+      });
     }
 
     // Get their auth status
@@ -276,6 +407,11 @@ export async function getUserOnboardingProgress(req: Request, res: Response): Pr
         slackUserId: user.slackUserId,
         createdAt: user.createdAt,
         status: user.status,
+        workspace: {
+          id: req.workspace.id,
+          name: req.workspace.name,
+          teamId: req.workspace.slackTeamId,
+        },
       },
       onboarding: {
         slackConnected: authStatus.slack.connected,
@@ -290,14 +426,14 @@ export async function getUserOnboardingProgress(req: Request, res: Response): Pr
       },
     };
 
-    res.json(progress);
+    res.json({
+      success: true,
+      progress,
+    });
 
   } catch (error) {
     console.error('Failed to get user onboarding progress:', error);
-    res.status(500).json({
-      error: 'Failed to get user onboarding progress',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 

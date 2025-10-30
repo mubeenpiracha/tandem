@@ -1,0 +1,100 @@
+config:
+  target: "{{ $processEnvironment.API_URL || 'http://localhost:3001' }}"
+  phases:
+    - duration: 60
+      arrivalRate: 10
+      name: "Warm up"
+    - duration: 120
+      arrivalRate: 50
+      name: "Ramp up load"
+    - duration: 300
+      arrivalRate: 100
+      name: "Sustained load"
+  defaults:
+    headers:
+      Content-Type: "application/json"
+  processor: "./processor.js"
+
+scenarios:
+  - name: "API Health Check"
+    weight: 20
+    flow:
+      - get:
+          url: "/health"
+      - think: 1
+
+  - name: "Slack Webhook Processing"
+    weight: 30
+    flow:
+      - post:
+          url: "/webhooks/slack/events"
+          json:
+            type: "event_callback"
+            team_id: "{{ $randomString() }}"
+            event:
+              type: "message"
+              text: "I need to finish the project report by tomorrow"
+              user: "U{{ $randomString() }}"
+              channel: "C{{ $randomString() }}"
+              ts: "{{ $timestamp }}"
+      - think: 2
+
+  - name: "Task Management"
+    weight: 25
+    flow:
+      # Get authentication token
+      - post:
+          url: "/api/auth/test-login"
+          json:
+            workspace_id: "{{ workspace_id }}"
+          capture:
+            - json: "$.token"
+              as: "auth_token"
+      # Create task
+      - post:
+          url: "/api/tasks"
+          headers:
+            Authorization: "Bearer {{ auth_token }}"
+            X-Workspace-ID: "{{ workspace_id }}"
+          json:
+            title: "Load test task {{ $randomString() }}"
+            description: "Generated during performance testing"
+            estimatedDuration: 60
+      # List tasks
+      - get:
+          url: "/api/tasks"
+          headers:
+            Authorization: "Bearer {{ auth_token }}"
+            X-Workspace-ID: "{{ workspace_id }}"
+      - think: 1
+
+  - name: "Workspace Metrics"
+    weight: 15
+    flow:
+      - get:
+          url: "/metrics"
+      - get:
+          url: "/status"
+      - think: 0.5
+
+  - name: "Multi-workspace Operations"
+    weight: 10
+    flow:
+      # Test workspace isolation
+      - loop:
+          - post:
+              url: "/api/auth/test-login"
+              json:
+                workspace_id: "{{ $randomWorkspaceId() }}"
+              capture:
+                - json: "$.token"
+                  as: "auth_token"
+                - json: "$.workspace_id"
+                  as: "current_workspace"
+          # Try to access tasks in current workspace
+          - get:
+              url: "/api/tasks"
+              headers:
+                Authorization: "Bearer {{ auth_token }}"
+                X-Workspace-ID: "{{ current_workspace }}"
+        count: 3

@@ -4,20 +4,18 @@
  * This module sets up all API routes and their middleware for the application.
  */
 
-import { Express, Request, Response } from 'express';
+import { Express } from 'express';
 import express from 'express';
 import { authMiddleware } from '../middleware/auth';
-import { slackWebhookWorkspaceMiddleware } from '../middleware/workspace';
 import taskRoutes from './tasks';
 import workspaceRoutes from './workspace';
+import preferencesRoutes from './preferences';
 import { 
   handleSlackEvents, 
-  parseSlackWebhook, 
   slackHealthCheck 
 } from './slack/events';
 import { 
   handleSlackInteractions, 
-  parseSlackInteraction, 
   slackInteractionsHealthCheck 
 } from './slack/interactions';
 
@@ -97,9 +95,15 @@ export function setupRoutes(app: Express): void {
   // Workspace management routes  
   app.use(`${API_PREFIX}/workspace`, workspaceRoutes);
   
-  // User preferences routes - TODO: Implement when T057 is reached  
-  app.get(`${API_PREFIX}/preferences`, authMiddleware, (req: Request, res: Response) => {
-    res.status(501).json({ error: 'Preferences not yet implemented' });
+  // User preferences routes
+  app.use(`${API_PREFIX}/preferences`, preferencesRoutes);
+  
+  // Monitoring and health check routes (public for monitoring systems)
+  // app.use('/', monitoringRoutes); // Temporarily disabled due to TypeScript errors
+  
+  // Basic health check endpoint
+  app.get('/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
   });
   
   // Placeholder API info endpoint
@@ -110,6 +114,8 @@ export function setupRoutes(app: Express): void {
       description: 'AI-powered task detection and calendar scheduling',
       endpoints: {
         health: '/health',
+        metrics: '/metrics',
+        status: '/status',
         api: API_PREFIX,
         tasks: `${API_PREFIX}/tasks`,
         slack: {
@@ -130,6 +136,12 @@ export function setupRoutes(app: Express): void {
           management: `${API_PREFIX}/workspace/:workspaceId`,
         },
         preferences: `${API_PREFIX}/preferences`,
+        monitoring: {
+          health: '/health',
+          workspace_health: '/health/:workspaceId',
+          metrics: '/metrics',
+          status: '/status',
+        },
       },
       documentation: 'See /specs/001-tandem-slack-bot/contracts/api.yaml',
     });

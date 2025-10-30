@@ -6,13 +6,27 @@
  */
 
 import { z } from 'zod';
-import type { TaskImportance, TaskStatus } from '@prisma/client';
+import type { TaskStatus } from '@prisma/client';
 
 // Common validation schemas
 export const SlackUserIdSchema = z.string().regex(/^[A-Z0-9]+$/, 'Invalid Slack user ID format');
 export const SlackChannelIdSchema = z.string().regex(/^[A-Z0-9]+$/, 'Invalid Slack channel ID format');
 export const SlackMessageIdSchema = z.string().regex(/^\d+\.\d+$/, 'Invalid Slack message ID format');
+export const SlackTeamIdSchema = z.string().regex(/^[A-Z0-9]+$/, 'Invalid Slack team ID format');
 export const UuidSchema = z.string().uuid('Invalid UUID format');
+
+// Workspace validation schemas
+export const WorkspaceContextSchema = z.object({
+  id: UuidSchema,
+  slackTeamId: SlackTeamIdSchema,
+  slackTeamName: z.string().min(1, 'Workspace name cannot be empty'),
+});
+
+export const WorkspaceScopedOperationSchema = z.object({
+  workspaceId: UuidSchema,
+  userId: SlackUserIdSchema.optional(),
+  resourceId: UuidSchema.optional(),
+});
 
 // Task detection validation schemas
 export const TaskDetectionInputSchema = z.object({
@@ -70,6 +84,29 @@ export class ValidationError extends Error {
   }
 }
 
+export class WorkspaceValidationError extends Error {
+  constructor(
+    message: string,
+    public workspaceId?: string,
+    public code: string = 'WORKSPACE_VALIDATION_ERROR'
+  ) {
+    super(message);
+    this.name = 'WorkspaceValidationError';
+  }
+}
+
+export class WorkspaceAccessError extends Error {
+  constructor(
+    message: string,
+    public workspaceId: string,
+    public userId?: string,
+    public resourceId?: string
+  ) {
+    super(message);
+    this.name = 'WorkspaceAccessError';
+  }
+}
+
 export class SlackAPIError extends Error {
   constructor(
     message: string,
@@ -89,6 +126,99 @@ export class OpenAIError extends Error {
   ) {
     super(message);
     this.name = 'OpenAIError';
+  }
+}
+
+/**
+ * Validate workspace context exists and is properly formed
+ */
+export function validateWorkspaceContext(workspace: any): asserts workspace is z.infer<typeof WorkspaceContextSchema> {
+  if (!workspace) {
+    throw new WorkspaceValidationError('Workspace context is required', undefined, 'MISSING_WORKSPACE_CONTEXT');
+  }
+  
+  const result = WorkspaceContextSchema.safeParse(workspace);
+  if (!result.success) {
+    const firstError = result.error.issues[0];
+    throw new WorkspaceValidationError(
+      `Invalid workspace context: ${firstError.message}`,
+      workspace.id,
+      'INVALID_WORKSPACE_CONTEXT'
+    );
+  }
+}
+
+/**
+ * Validate workspace-scoped operation parameters
+ */
+export function validateWorkspaceScopedOperation(data: any): asserts data is z.infer<typeof WorkspaceScopedOperationSchema> {
+  const result = WorkspaceScopedOperationSchema.safeParse(data);
+  if (!result.success) {
+    const firstError = result.error.issues[0];
+    throw new ValidationError(
+      `Invalid workspace-scoped operation: ${firstError.message}`,
+      firstError.path.join('.'),
+      data
+    );
+  }
+}
+
+/**
+ * Validate that a user belongs to a specific workspace
+ */
+export function validateUserWorkspaceAccess(
+  userId: string,
+  userWorkspaceId: string,
+  requestedWorkspaceId: string,
+  resourceType: string = 'resource'
+): void {
+  if (userWorkspaceId !== requestedWorkspaceId) {
+    throw new WorkspaceAccessError(
+      `Access denied: User does not have access to ${resourceType} in this workspace`,
+      requestedWorkspaceId,
+      userId
+    );
+  }
+}
+
+/**
+ * Validate that a resource belongs to a specific workspace
+ */
+export function validateResourceWorkspaceAccess(
+  resourceId: string,
+  resourceWorkspaceId: string,
+  requestedWorkspaceId: string,
+  resourceType: string = 'resource'
+): void {
+  if (resourceWorkspaceId !== requestedWorkspaceId) {
+    throw new WorkspaceAccessError(
+      `Access denied: ${resourceType} does not belong to this workspace`,
+      requestedWorkspaceId,
+      undefined,
+      resourceId
+    );
+  }
+}
+
+/**
+ * Validate Slack team ID format and workspace consistency
+ */
+export function validateSlackTeamId(teamId: string, workspaceTeamId?: string): void {
+  const result = SlackTeamIdSchema.safeParse(teamId);
+  if (!result.success) {
+    throw new ValidationError(
+      'Invalid Slack team ID format',
+      'slackTeamId',
+      teamId
+    );
+  }
+  
+  if (workspaceTeamId && teamId !== workspaceTeamId) {
+    throw new WorkspaceValidationError(
+      'Slack team ID does not match workspace',
+      undefined,
+      'TEAM_ID_MISMATCH'
+    );
   }
 }
 
@@ -244,6 +374,26 @@ export function createErrorResponse(error: Error) {
     };
   }
   
+  if (error instanceof WorkspaceValidationError) {
+    return {
+      error: 'Workspace validation error',
+      message: error.message,
+      workspaceId: error.workspaceId,
+      code: error.code,
+    };
+  }
+  
+  if (error instanceof WorkspaceAccessError) {
+    return {
+      error: 'Workspace access denied',
+      message: error.message,
+      workspaceId: error.workspaceId,
+      userId: error.userId,
+      resourceId: error.resourceId,
+      code: 'WORKSPACE_ACCESS_DENIED',
+    };
+  }
+  
   if (error instanceof TaskDetectionError) {
     return {
       error: 'Task detection error',
@@ -292,7 +442,51 @@ export function validateRateLimit(
 }
 
 /**
- * Log task detection metrics for monitoring
+ * Generic validation result type
+ */
+export interface ValidationResult<T> {
+  success: boolean;
+  data?: T;
+  errors?: Array<{
+    path: string;
+    message: string;
+  }>;
+}
+
+/**
+ * Generic validation function using Zod schemas
+ */
+export function validate<T>(schema: z.ZodSchema<T>, data: any): ValidationResult<T> {
+  try {
+    const result = schema.safeParse(data);
+    
+    if (result.success) {
+      return {
+        success: true,
+        data: result.data,
+      };
+    } else {
+      return {
+        success: false,
+        errors: result.error.issues.map((issue: any) => ({
+          path: issue.path.join('.'),
+          message: issue.message,
+        })),
+      };
+    }
+  } catch (error) {
+    return {
+      success: false,
+      errors: [{
+        path: 'root',
+        message: error instanceof Error ? error.message : 'Validation failed',
+      }],
+    };
+  }
+}
+
+/**
+ * Log task detection metrics for monitoring with workspace context
  */
 export function logTaskDetectionMetrics(
   userId: string,
@@ -302,11 +496,38 @@ export function logTaskDetectionMetrics(
     tasksCreated: number;
     processingTime: number;
     confidence?: number;
+  },
+  workspaceContext?: { id: string; slackTeamName: string }
+): void {
+  const workspaceInfo = workspaceContext 
+    ? `[Workspace: ${workspaceContext.slackTeamName}]` 
+    : '[Unknown Workspace]';
+    
+  console.log(`📊 ${workspaceInfo} Task Detection Metrics [${messageId}]:`, {
+    userId,
+    workspaceId: workspaceContext?.id,
+    ...result,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+/**
+ * Log workspace validation events for security monitoring
+ */
+export function logWorkspaceValidation(
+  event: 'access_granted' | 'access_denied' | 'validation_failed',
+  details: {
+    userId?: string;
+    workspaceId?: string;
+    resourceType?: string;
+    resourceId?: string;
+    reason?: string;
   }
 ): void {
-  console.log(`📊 Task Detection Metrics [${messageId}]:`, {
-    userId,
-    ...result,
+  const level = event === 'access_denied' ? '🚨' : event === 'validation_failed' ? '⚠️' : '✅';
+  
+  console.log(`${level} Workspace Validation [${event}]:`, {
+    ...details,
     timestamp: new Date().toISOString(),
   });
 }

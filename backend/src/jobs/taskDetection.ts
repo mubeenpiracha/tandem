@@ -12,11 +12,11 @@ import { sendTaskConfirmation } from '../services/slack/dmSender';
 import { createSlackMessage, updateSlackMessage, isMessageProcessed } from '../models/slackMessage';
 import { createTask } from '../models/task';
 import { findUserBySlackId } from '../models/user';
+import { findWorkspaceById } from '../models/workspace';
 import { config } from '../config';
 import {
   validateTaskDetectionData,
   sanitizeMessageText,
-  shouldProcessMessage,
   TaskDetectionError,
   ValidationError,
   SlackAPIError,
@@ -76,13 +76,23 @@ async function processTaskDetection(data: TaskDetectionJobData): Promise<TaskDet
       return result;
     }
 
-    // Find user by Slack ID
+    // Find user by Slack ID (workspace-scoped)
     const user = await findUserBySlackId(slackUserId, workspaceId);
     if (!user) {
       throw new ValidationError(
-        `User not found for Slack ID: ${slackUserId}`,
+        `User not found for Slack ID: ${slackUserId} in workspace: ${workspaceId}`,
         'userId',
         slackUserId
+      );
+    }
+
+    // Get workspace information for bot token
+    const workspace = await findWorkspaceById(workspaceId);
+    if (!workspace) {
+      throw new ValidationError(
+        `Workspace not found: ${workspaceId}`,
+        'workspaceId',
+        workspaceId
       );
     }
 
@@ -104,12 +114,12 @@ async function processTaskDetection(data: TaskDetectionJobData): Promise<TaskDet
 
       result.tasksDetected = detectionResult.tasks.length;
 
-      // If no tasks detected, mark as processed
+      // If no tasks detected, mark as processed (workspace-scoped)
       if (!detectionResult.isTask || detectionResult.tasks.length === 0) {
         await updateSlackMessage(slackMessage.id, { 
           status: 'IGNORED',
           processedAt: new Date(),
-        });
+        }, workspaceId);
         result.processed = true;
         
         Logger.taskDetection.completed(messageId, user.id, {
@@ -150,18 +160,23 @@ async function processTaskDetection(data: TaskDetectionJobData): Promise<TaskDet
         }
       }
 
-      // Send confirmation messages for created tasks
+      // Send confirmation messages for created tasks (workspace-aware)
       for (const { task, confidence } of createdTasks) {
         try {
-          const confirmationMessageId = await sendTaskConfirmation(user.id, slackUserId, {
-            taskId: task.id,
-            title: task.title,
-            description: task.description || '',
-            dueDate: task.dueDate?.toISOString(),
-            estimatedDuration: task.estimatedDuration,
-            importance: task.importance,
-            confidence,
-          });
+          const confirmationMessageId = await sendTaskConfirmation(
+            slackUserId, 
+            {
+              taskId: task.id,
+              title: task.title,
+              description: task.description || '',
+              dueDate: task.dueDate?.toISOString(),
+              estimatedDuration: task.estimatedDuration,
+              importance: task.importance,
+              confidence,
+            },
+            workspaceId,
+            user.id
+          );
           
           result.confirmationsSent++;
           Logger.taskDetection.confirmationSent(task.id, user.id, confirmationMessageId);
@@ -172,11 +187,11 @@ async function processTaskDetection(data: TaskDetectionJobData): Promise<TaskDet
         }
       }
 
-      // Update SlackMessage status
+      // Update SlackMessage status (workspace-scoped)
       await updateSlackMessage(slackMessage.id, { 
         status: result.tasksCreated > 0 ? 'PROCESSED' : 'IGNORED',
         processedAt: new Date(),
-      });
+      }, workspaceId);
       result.processed = true;
 
       // Log successful completion
@@ -191,11 +206,11 @@ async function processTaskDetection(data: TaskDetectionJobData): Promise<TaskDet
       });
 
     } catch (error) {
-      // Update SlackMessage status on error
+      // Update SlackMessage status on error (workspace-scoped)
       await updateSlackMessage(slackMessage.id, { 
         status: 'ERROR',
         processedAt: new Date(),
-      });
+      }, workspaceId);
       throw error;
     }
 

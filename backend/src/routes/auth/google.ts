@@ -2,16 +2,32 @@
  * Google OAuth authentication routes
  * 
  * This module handles the Google OAuth 2.0 flow for user authentication
- * and token management for Google Calendar integration.
+ * and token management for Google Calendar integration within workspace context.
  */
 
-import { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { google } from 'googleapis';
 import { findUserById } from '../../models/user';
+import { findWorkspaceById } from '../../models/workspace';
 import { upsertGoogleToken } from '../../models/googleToken';
 import { generateOAuthState, validateOAuthState } from '../../services/oauth';
 import { config } from '../../config';
 import { Logger } from '../../utils/logger';
+import { validate } from '../../utils/validation';
+import { z } from 'zod';
+
+// Validation schemas
+const googleLoginQuerySchema = z.object({
+  redirect_to: z.string().url().optional(),
+  workspace: z.string().uuid().optional(), // Optional workspace context
+});
+
+const googleCallbackQuerySchema = z.object({
+  code: z.string().min(1, 'Authorization code is required'),
+  state: z.string().min(1, 'State parameter is required'),
+  error: z.string().optional(),
+  error_description: z.string().optional(),
+});
 
 // Google OAuth interfaces
 interface GoogleTokenResponse {
@@ -46,19 +62,60 @@ function createGoogleOAuthClient() {
 }
 
 /**
- * Initiate Google OAuth flow
+ * Initiate Google OAuth flow for user authentication and Calendar access.
+ * Requires user to be authenticated with their workspace first.
  */
-export async function initiateGoogleOAuth(req: Request, res: Response): Promise<void> {
+/**
+ * Initiate Google OAuth flow for user authentication and Calendar access.
+ * Requires user to be authenticated with their workspace first.
+ */
+export async function initiateGoogleOAuth(req: Request, res: Response, next: NextFunction) {
   try {
-    const { redirect_to } = req.query;
-    
-    if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+    const queryValidation = validate(googleLoginQuerySchema, req.query);
+    if (!queryValidation.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid query parameters',
+        details: queryValidation.errors,
+      });
     }
 
-    // Generate secure state parameter
-    const state = generateOAuthState('google', req.user.id, redirect_to as string);
+    const { redirect_to, workspace: workspaceId } = queryValidation.data || {};
+    
+    // TODO: Add authentication middleware - for now check if user exists in request
+    if (!req.user) {
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication required',
+        message: 'User must be authenticated before connecting Google Calendar',
+      });
+    }
+
+    // Get user to find their workspace context
+    const user = await findUserById(req.user.id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    // Get workspace context for logging
+    let workspaceContext;
+    try {
+      const workspace = await findWorkspaceById(user.workspaceId);
+      if (workspace) {
+        workspaceContext = {
+          id: workspace.id,
+          slackTeamName: workspace.slackTeamName,
+        };
+      }
+    } catch (error) {
+      // Continue without workspace context if there's an error
+    }
+
+    // Generate secure state parameter with workspace context
+    const state = generateOAuthState('google', req.user.id, redirect_to);
     
     // Create OAuth client and get authorization URL
     const oauth2Client = createGoogleOAuthClient();
@@ -71,75 +128,97 @@ export async function initiateGoogleOAuth(req: Request, res: Response): Promise<
       include_granted_scopes: true,
     });
 
-    Logger.auth.oauthInitiated('google', state);
+    Logger.auth.oauthInitiated('google', state, workspaceContext);
 
     res.redirect(authUrl);
   } catch (error) {
     console.error('Google OAuth initiation failed:', error);
-    res.status(500).json({
-      error: 'Failed to initiate Google OAuth',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Handle Google OAuth callback
+ * Handle Google OAuth callback and store calendar access tokens.
  */
-export async function handleGoogleOAuthCallback(req: Request, res: Response): Promise<void> {
+/**
+ * Handle Google OAuth callback and store calendar access tokens.
+ */
+export async function handleGoogleOAuthCallback(req: Request, res: Response, next: NextFunction) {
   try {
-    const { code, state, error } = req.query;
+    const queryValidation = validate(googleCallbackQuerySchema, req.query);
+    if (!queryValidation.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid callback parameters',
+        details: queryValidation.errors,
+      });
+    }
+
+    if (!queryValidation.data) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing callback data',
+        details: queryValidation.errors,
+      });
+    }
+
+    const { code, state, error, error_description } = queryValidation.data;
 
     // Handle OAuth errors
     if (error) {
       console.error('Google OAuth error:', error);
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'OAuth authorization failed',
-        details: error,
+        details: error_description || error,
       });
-      return;
-    }
-
-    // Validate required parameters
-    if (!code || !state) {
-      res.status(400).json({
-        error: 'Missing required parameters',
-        details: 'Authorization code and state are required',
-      });
-      return;
     }
 
     // Validate state parameter
-    const stateData = validateOAuthState(state as string);
+    const stateData = validateOAuthState(state);
     if (!stateData || stateData.provider !== 'google') {
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'Invalid state parameter',
         details: 'State validation failed',
       });
-      return;
     }
 
     // Verify user exists
     if (!stateData.userId) {
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'User ID missing from state',
         details: 'User must be authenticated before connecting Google',
       });
-      return;
     }
 
     const user = await findUserById(stateData.userId);
     if (!user) {
-      res.status(404).json({
+      return res.status(404).json({
+        success: false,
         error: 'User not found',
         details: 'Invalid user ID in state parameter',
       });
-      return;
+    }
+
+    // Get workspace context for logging
+    let workspaceContext;
+    try {
+      const workspace = await findWorkspaceById(user.workspaceId);
+      if (workspace) {
+        workspaceContext = {
+          id: workspace.id,
+          slackTeamName: workspace.slackTeamName,
+        };
+      }
+    } catch (error) {
+      // Continue without workspace context if there's an error
     }
 
     // Exchange code for tokens
     const oauth2Client = createGoogleOAuthClient();
-    const { tokens } = await oauth2Client.getToken(code as string);
+    const { tokens } = await oauth2Client.getToken(code);
     
     if (!tokens.access_token) {
       throw new Error('No access token received from Google');
@@ -166,8 +245,8 @@ export async function handleGoogleOAuthCallback(req: Request, res: Response): Pr
       expiresAt,
     });
 
-    Logger.auth.tokenStored(user.id, 'google');
-    Logger.auth.userUpdated(user.id, 'google');
+    Logger.auth.tokenStored(user.id, 'google', workspaceContext);
+    Logger.auth.userUpdated(user.id, 'google', workspaceContext);
 
     // Redirect to success page
     const redirectTo = stateData.redirectTo || '/dashboard';
@@ -179,6 +258,10 @@ export async function handleGoogleOAuthCallback(req: Request, res: Response): Pr
           id: user.id,
           email: user.email,
           googleEmail: googleUserInfo.email,
+          workspace: workspaceContext ? {
+            id: workspaceContext.id,
+            name: workspaceContext.slackTeamName,
+          } : undefined,
         },
         redirectTo,
       });
@@ -186,6 +269,9 @@ export async function handleGoogleOAuthCallback(req: Request, res: Response): Pr
       // Redirect to success page
       const redirectUrl = new URL(redirectTo, config.server.baseUrl);
       redirectUrl.searchParams.set('google_connected', 'true');
+      if (workspaceContext) {
+        redirectUrl.searchParams.set('workspace', workspaceContext.id);
+      }
       res.redirect(redirectUrl.toString());
     }
 
@@ -193,17 +279,17 @@ export async function handleGoogleOAuthCallback(req: Request, res: Response): Pr
     console.error('Google OAuth callback failed:', error);
     Logger.auth.oauthFailed('google', error instanceof Error ? error.message : 'Unknown error');
     
-    res.status(500).json({
-      error: 'OAuth callback failed',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Revoke Google OAuth tokens
+ * Revoke Google OAuth tokens for the authenticated user.
  */
-export async function revokeGoogleAuth(req: Request, res: Response): Promise<void> {
+/**
+ * Revoke Google OAuth tokens for the authenticated user.
+ */
+export async function revokeGoogleAuth(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) {
       res.status(401).json({ error: 'Authentication required' });
@@ -242,21 +328,23 @@ export async function revokeGoogleAuth(req: Request, res: Response): Promise<voi
 
   } catch (error) {
     console.error('Google auth revocation failed:', error);
-    res.status(500).json({
-      error: 'Failed to revoke Google authentication',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Get Google authentication status
+ * Get Google authentication status for the authenticated user.
  */
-export async function getGoogleAuthStatus(req: Request, res: Response): Promise<void> {
+/**
+ * Get Google authentication status for the authenticated user.
+ */
+export async function getGoogleAuthStatus(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication required' 
+      });
     }
 
     const { findGoogleTokenByUser, isGoogleTokenExpired } = await import('../../models/googleToken');
@@ -284,18 +372,18 @@ export async function getGoogleAuthStatus(req: Request, res: Response): Promise<
     }
 
     res.json({
-      connected: !!token && !isExpired && isConnected,
-      hasToken: !!token,
-      isExpired,
-      lastUpdated: token?.updatedAt || null,
+      success: true,
+      status: {
+        connected: !!token && !isExpired && isConnected,
+        hasToken: !!token,
+        isExpired,
+        lastUpdated: token?.updatedAt || null,
+      },
     });
 
   } catch (error) {
     console.error('Google auth status check failed:', error);
-    res.status(500).json({
-      error: 'Failed to check Google authentication status',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 

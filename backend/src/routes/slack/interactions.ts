@@ -7,9 +7,11 @@
 
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
-import { updateTaskStatus } from '../../models/task';
+import { updateTaskStatus, findTaskByIdInWorkspace } from '../../models/task';
 import { findUserBySlackId } from '../../models/user';
 import { sendDirectMessage } from '../../services/slack/dmSender';
+import { verifySlackSignature } from './events';
+import { addCalendarSchedulingJob, CalendarJobType } from '../../jobs/calendar_scheduling';
 import { config } from '../../config';
 
 // Slack interaction interfaces
@@ -49,39 +51,6 @@ interface SlackInteractionPayload {
 }
 
 /**
- * Verify Slack request signature for interactions
- */
-function verifySlackInteractionSignature(req: Request): boolean {
-  const slackSignature = req.headers['x-slack-signature'] as string;
-  const timestamp = req.headers['x-slack-request-timestamp'] as string;
-  
-  if (!slackSignature || !timestamp) {
-    console.warn('Missing Slack signature headers in interaction');
-    return false;
-  }
-
-  // Check timestamp (within 5 minutes)
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - parseInt(timestamp)) > 300) {
-    console.warn('Slack interaction timestamp too old');
-    return false;
-  }
-
-  // Verify signature using raw body
-  const rawBody = (req as any).rawBody || '';
-  const sigBasestring = 'v0:' + timestamp + ':' + rawBody;
-  const expectedSignature = 'v0=' + crypto
-    .createHmac('sha256', config.slack.signingSecret)
-    .update(sigBasestring, 'utf8')
-    .digest('hex');
-
-  return crypto.timingSafeEqual(
-    Buffer.from(expectedSignature, 'utf8'),
-    Buffer.from(slackSignature, 'utf8')
-  );
-}
-
-/**
  * Handle task confirmation button clicks
  */
 async function handleTaskConfirmation(
@@ -98,12 +67,8 @@ async function handleTaskConfirmation(
   }
 
   try {
-    // Parse action value (format: "action:taskId")
-    const [actionType, taskId] = actionValue.split(':');
-    
-    if (!taskId) {
-      return { text: '❌ Invalid action - missing task ID.' };
-    }
+    // The action value contains the task ID directly (from dmSender.ts)
+    const taskId = actionValue;
 
     // Find user in our database
     const dbUser = await findUserBySlackId(user.id, workspaceId);
@@ -113,42 +78,74 @@ async function handleTaskConfirmation(
       };
     }
 
-    switch (actionType) {
-      case 'confirm':
+    switch (action.action_id) {
+      case 'confirm_task':
         // Update task status to confirmed
-        const confirmedTask = await updateTaskStatus(taskId, 'CONFIRMED');
+        const confirmedTask = await updateTaskStatus(taskId, 'CONFIRMED', workspaceId);
         
-        console.log(`✅ Task confirmed: ${confirmedTask.title} (ID: ${taskId}) by user ${user.id}`);
+        console.log(`✅ [Workspace ID: ${workspaceId}] Task confirmed: ${confirmedTask.title} (ID: ${taskId}) by user ${user.id}`);
         
-        // Send confirmation message
-        setTimeout(async () => {
-          try {
-            await sendDirectMessage(dbUser.id, user.id, {
-              text: `✅ Task confirmed: "${confirmedTask.title}"\n\nI'll work on scheduling this in your calendar based on your preferences.`,
-              blocks: [],
-            });
-          } catch (error) {
-            console.error('Failed to send confirmation follow-up:', error);
-          }
-        }, 1000);
+        // Trigger automatic calendar scheduling
+        try {
+          const jobId = await addCalendarSchedulingJob({
+            jobType: CalendarJobType.SCHEDULE_TASK,
+            workspaceId,
+            userId: dbUser.id,
+            taskId,
+            sendConfirmation: true, // Send confirmation when scheduled
+          }, 8); // High priority for confirmed tasks
+          
+          console.log(`📅 [Workspace ID: ${workspaceId}] Calendar scheduling job ${jobId} created for task ${taskId}`);
+          
+          // Send confirmation message with scheduling info
+          setTimeout(async () => {
+            try {
+              await sendDirectMessage(user.id, {
+                text: `✅ Task confirmed: "${confirmedTask.title}"\n\nI'm now finding the best time to schedule this in your calendar. You'll receive another message once it's scheduled!`,
+                blocks: [],
+              }, workspaceId);
+            } catch (error) {
+              console.error('Failed to send confirmation follow-up:', error);
+            }
+          }, 1000);
 
-        return {
-          text: `✅ Confirmed: "${confirmedTask.title}"\n\nI'll schedule this task in your calendar and send you an update.`,
-          replace_original: true,
-        };
+          return {
+            text: `✅ Confirmed: "${confirmedTask.title}"\n\n🗓️ Scheduling in your calendar... You'll get an update when it's scheduled!`,
+            replace_original: true,
+          };
+        } catch (schedulingError) {
+          console.error(`Failed to create calendar scheduling job for task ${taskId}:`, schedulingError);
+          
+          // Still confirm the task even if scheduling fails
+          setTimeout(async () => {
+            try {
+              await sendDirectMessage(user.id, {
+                text: `✅ Task confirmed: "${confirmedTask.title}"\n\n⚠️ I couldn't automatically schedule this in your calendar. You can manually schedule it using the task dashboard or by asking me to schedule it later.`,
+                blocks: [],
+              }, workspaceId);
+            } catch (error) {
+              console.error('Failed to send confirmation follow-up:', error);
+            }
+          }, 1000);
 
-      case 'dismiss':
+          return {
+            text: `✅ Confirmed: "${confirmedTask.title}"\n\n⚠️ Automatic scheduling failed. You can schedule it manually.`,
+            replace_original: true,
+          };
+        }
+
+      case 'dismiss_task':
         // Update task status to dismissed
-        const dismissedTask = await updateTaskStatus(taskId, 'DISMISSED');
+        const dismissedTask = await updateTaskStatus(taskId, 'DISMISSED', workspaceId);
         
-        console.log(`❌ Task dismissed: ${dismissedTask.title} (ID: ${taskId}) by user ${user.id}`);
+        console.log(`❌ [Workspace ID: ${workspaceId}] Task dismissed: ${dismissedTask.title} (ID: ${taskId}) by user ${user.id}`);
         
         return {
           text: `❌ Task dismissed: "${dismissedTask.title}"\n\nNo worries, I won't schedule this one.`,
           replace_original: true,
         };
 
-      case 'modify':
+      case 'edit_task':
         // For now, just provide a message about modification
         // In a full implementation, this could open a modal for editing
         return {
@@ -161,7 +158,7 @@ async function handleTaskConfirmation(
     }
 
   } catch (error) {
-    console.error('Task confirmation error:', error);
+    console.error(`[Workspace ID: ${workspaceId}] Task confirmation error:`, error);
     
     if (error instanceof Error) {
       if (error.message === 'Task not found') {
@@ -182,7 +179,7 @@ async function handleTaskConfirmation(
 export async function handleSlackInteractions(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     // Verify request signature
-    if (!verifySlackInteractionSignature(req)) {
+    if (!verifySlackSignature(req)) {
       console.warn('Invalid Slack interaction signature');
       res.status(401).json({ error: 'Invalid signature' });
       return;
@@ -197,7 +194,14 @@ export async function handleSlackInteractions(req: Request, res: Response, next:
 
     const payload: SlackInteractionPayload = JSON.parse(payloadString);
     
-    console.log(`🎯 Received Slack interaction: ${payload.type} from user ${payload.user.id}`);
+    // Validate workspace context exists
+    if (!req.workspace) {
+      console.error('Workspace context missing in interaction handler');
+      res.status(400).json({ error: 'Workspace context required' });
+      return;
+    }
+    
+    console.log(`🎯 [Workspace: ${req.workspace.slackTeamName}] Received Slack interaction: ${payload.type} from user ${payload.user.id}`);
 
     // Handle different interaction types
     if (payload.type === 'block_actions') {
@@ -212,14 +216,14 @@ export async function handleSlackInteractions(req: Request, res: Response, next:
 
       // Route actions based on action_id
       switch (action.action_id) {
-        case 'task_confirm':
-        case 'task_dismiss':
-        case 'task_modify':
+        case 'confirm_task':
+        case 'dismiss_task':
+        case 'edit_task':
           response = await handleTaskConfirmation(action, payload, req.workspaceId!);
           break;
           
         default:
-          console.warn(`Unknown action_id: ${action.action_id}`);
+          console.warn(`[Workspace: ${req.workspace.slackTeamName}] Unknown action_id: ${action.action_id}`);
           response = { text: '❌ Unknown action. Please try again.' };
       }
 
@@ -240,11 +244,12 @@ export async function handleSlackInteractions(req: Request, res: Response, next:
     }
 
     // Unknown interaction type
-    console.warn(`Unknown interaction type: ${payload.type}`);
+    console.warn(`[Workspace: ${req.workspace?.slackTeamName || 'Unknown'}] Unknown interaction type: ${payload.type}`);
     res.status(200).json({ text: 'Unknown interaction type.' });
 
   } catch (error) {
-    console.error('Slack interaction handler error:', error);
+    const workspaceContext = req.workspace ? `[Workspace: ${req.workspace.slackTeamName}]` : '[Unknown Workspace]';
+    console.error(`${workspaceContext} Slack interaction handler error:`, error);
     
     // Send user-friendly error response
     try {
@@ -295,9 +300,9 @@ export function slackInteractionsHealthCheck(req: Request, res: Response): void 
     service: 'slack-interactions',
     timestamp: new Date().toISOString(),
     supportedActions: [
-      'task_confirm',
-      'task_dismiss', 
-      'task_modify',
+      'confirm_task',
+      'dismiss_task', 
+      'edit_task',
     ],
   });
 }

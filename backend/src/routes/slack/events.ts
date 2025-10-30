@@ -38,7 +38,7 @@ interface SlackEventPayload {
 /**
  * Verify Slack request signature
  */
-function verifySlackSignature(req: Request): boolean {
+export function verifySlackSignature(req: Request): boolean {
   const slackSignature = req.headers['x-slack-signature'] as string;
   const timestamp = req.headers['x-slack-request-timestamp'] as string;
   
@@ -106,10 +106,17 @@ function shouldProcessMessage(event: SlackEvent): boolean {
 }
 
 /**
- * Handle Slack event webhook
+ * Handle Slack event webhook (workspace-aware)
  */
 export async function handleSlackEvents(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
+    // Verify Slack signature first
+    if (!verifySlackSignature(req)) {
+      console.warn('⚠️ Invalid Slack signature - request rejected');
+      res.status(401).json({ error: 'Invalid signature' });
+      return;
+    }
+
     const payload = req.body as SlackEventPayload;
 
     // Handle URL verification challenge first
@@ -147,14 +154,14 @@ export async function handleSlackEvents(req: Request, res: Response, next: NextF
       }
 
       const event = payload.event;
-      console.log(`📨 Received Slack event: ${event.type} from user ${event.user} in channel ${event.channel}`);
+      console.log(`📨 [Workspace: ${workspace.slackTeamName}] Received Slack event: ${event.type} from user ${event.user} in channel ${event.channel}`);
 
       // Handle message events
       if (event.type === 'message' && shouldProcessMessage(event)) {
-        console.log(`🔍 Processing message for task detection: "${event.text?.substring(0, 100)}..."`);
+        console.log(`🔍 [Workspace: ${workspace.slackTeamName}] Processing message for task detection: "${event.text?.substring(0, 100)}..."`);
 
         try {
-          // Add to task detection queue
+          // Add to task detection queue with workspace context
           await addTaskDetectionJob({
             workspaceId: workspace.id,
             messageId: event.ts!,
@@ -165,13 +172,13 @@ export async function handleSlackEvents(req: Request, res: Response, next: NextF
             messageTimestamp: new Date(parseFloat(event.ts!) * 1000).toISOString(),
           });
 
-          console.log(`✅ Task detection job queued for message ${event.ts}`);
+          console.log(`✅ [Workspace: ${workspace.slackTeamName}] Task detection job queued for message ${event.ts}`);
         } catch (error) {
-          console.error('Failed to queue task detection job:', error);
+          console.error(`❌ [Workspace: ${workspace.slackTeamName}] Failed to queue task detection job:`, error);
           // Don't return error to Slack - we don't want them to retry
         }
       } else {
-        console.log(`⚠️ Skipping message: type=${event.type}, shouldProcess=${shouldProcessMessage(event)}`);
+        console.log(`⚠️ [Workspace: ${workspace.slackTeamName}] Skipping message: type=${event.type}, shouldProcess=${shouldProcessMessage(event)}`);
       }
 
       // Always respond with 200 to acknowledge receipt

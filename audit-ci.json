@@ -1,0 +1,17 @@
+{
+  "moderate": true,
+  "high": true,
+  "critical": true,
+  "allowlist": [],
+  "report-type": "full",
+  "advisories": [],
+  "whitelist": [],
+  "output-format": "json",
+  "pass-enoaudit": true,
+  "show-found": true,
+  "show-not-found": false,
+  "retry": {
+    "count": 3,
+    "delay": 1000
+  }
+}

@@ -2,16 +2,33 @@
  * Slack OAuth authentication routes
  * 
  * This module handles the Slack OAuth 2.0 flow for user authentication
- * and token management.
+ * within workspace context and token management with workspace scoping.
  */
 
-import { Request, Response, NextFunction } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { WebClient } from '@slack/web-api';
 import { createUser, findUserBySlackId, updateUser } from '../../models/user';
 import { upsertSlackToken } from '../../models/slackToken';
+import { findWorkspaceBySlackTeamId, findWorkspaceById } from '../../models/workspace';
 import { generateOAuthState, validateOAuthState } from '../../services/oauth';
 import { config } from '../../config';
 import { Logger } from '../../utils/logger';
+import { validate } from '../../utils/validation';
+import { z } from 'zod';
+
+// Validation schemas
+const slackLoginQuerySchema = z.object({
+  workspace: z.string().uuid().optional(), // Workspace ID for context
+  redirect_to: z.string().url().optional(),
+  state: z.string().optional(),
+});
+
+const slackCallbackQuerySchema = z.object({
+  code: z.string().min(1, 'Authorization code is required'),
+  state: z.string().min(1, 'State parameter is required'),
+  error: z.string().optional(),
+  error_description: z.string().optional(),
+});
 
 // Slack OAuth interfaces
 interface SlackOAuthResponse {
@@ -55,87 +72,125 @@ interface SlackUserInfo {
 }
 
 /**
- * Initiate Slack OAuth flow
+ * GET /auth/slack/login
+ * 
+ * Initiate Slack OAuth flow for user authentication within workspace context.
+ * This is different from workspace installation - this authenticates individual users.
  */
-export async function initiateSlackOAuth(req: Request, res: Response): Promise<void> {
+/**
+ * Initiate Slack OAuth flow for user authentication within workspace context.
+ * This is different from workspace installation - this authenticates individual users.
+ */
+export async function initiateSlackOAuth(req: Request, res: Response, next: NextFunction) {
   try {
-    const { redirect_to } = req.query;
+    const queryValidation = validate(slackLoginQuerySchema, req.query);
+    if (!queryValidation.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid query parameters',
+        details: queryValidation.errors,
+      });
+    }
+
+    const { workspace: workspaceId, redirect_to } = queryValidation.data || {};
     
-    // Generate secure state parameter
-    const state = generateOAuthState('slack', undefined, redirect_to as string);
+    // If workspace is specified, validate it exists
+    let workspaceContext: { id: string; slackTeamName: string } | undefined = undefined;
+    if (workspaceId) {
+      const workspace = await findWorkspaceById(workspaceId);
+      if (!workspace || !workspace.isActive) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid workspace',
+          message: 'Workspace not found or inactive',
+        });
+      }
+      workspaceContext = { id: workspace.id, slackTeamName: workspace.slackTeamName };
+    }
     
-    // Build Slack OAuth URL
+    // Generate secure state parameter with workspace context
+    const state = generateOAuthState('slack', workspaceId, redirect_to);
+    
+    // Build Slack OAuth URL for user authentication
     const authUrl = new URL('https://slack.com/oauth/v2/authorize');
     authUrl.searchParams.set('client_id', config.slack.clientId);
-    authUrl.searchParams.set('scope', config.slack.botScopes.join(','));
+    authUrl.searchParams.set('user_scope', config.slack.userScopes.join(','));
     authUrl.searchParams.set('redirect_uri', config.slack.redirectUri);
     authUrl.searchParams.set('state', state);
-    authUrl.searchParams.set('user_scope', config.slack.userScopes.join(','));
 
-    Logger.auth.oauthInitiated('slack', state);
+    Logger.auth.oauthInitiated('slack', state, workspaceContext);
 
     res.redirect(authUrl.toString());
   } catch (error) {
     console.error('Slack OAuth initiation failed:', error);
-    res.status(500).json({
-      error: 'Failed to initiate Slack OAuth',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Handle Slack OAuth callback
+ * Handle Slack OAuth callback for user authentication within workspace context.
  */
-export async function handleSlackOAuthCallback(req: Request, res: Response): Promise<void> {
+/**
+ * Handle Slack OAuth callback for user authentication within workspace context.
+ */
+export async function handleSlackOAuthCallback(req: Request, res: Response, next: NextFunction) {
   try {
-    const { code, state, error } = req.query;
+    const queryValidation = validate(slackCallbackQuerySchema, req.query);
+    if (!queryValidation.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid callback parameters',
+        details: queryValidation.errors,
+      });
+    }
+
+    if (!queryValidation.data) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing callback data',
+        details: queryValidation.errors,
+      });
+    }
+
+    const { code, state, error, error_description } = queryValidation.data;
 
     // Handle OAuth errors
     if (error) {
       console.error('Slack OAuth error:', error);
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'OAuth authorization failed',
-        details: error,
+        details: error_description || error,
       });
-      return;
-    }
-
-    // Validate required parameters
-    if (!code || !state) {
-      res.status(400).json({
-        error: 'Missing required parameters',
-        details: 'Authorization code and state are required',
-      });
-      return;
     }
 
     // Validate state parameter
-    const stateData = validateOAuthState(state as string);
+    const stateData = validateOAuthState(state);
     if (!stateData || stateData.provider !== 'slack') {
-      res.status(400).json({
+      return res.status(400).json({
+        success: false,
         error: 'Invalid state parameter',
         details: 'State validation failed',
       });
-      return;
     }
 
     // Exchange code for tokens
-    const tokenResponse = await exchangeSlackCode(code as string);
+    const tokenResponse = await exchangeSlackCode(code);
     if (!tokenResponse.ok || !tokenResponse.authed_user) {
       throw new Error(`Token exchange failed: ${tokenResponse.error}`);
     }
 
     // Find workspace by Slack team ID
-    const { findWorkspaceBySlackTeamId } = await import('../../models/workspace');
     const workspace = await findWorkspaceBySlackTeamId(tokenResponse.team.id);
-    if (!workspace) {
-      res.status(400).json({
+    if (!workspace || !workspace.isActive) {
+      return res.status(400).json({
+        success: false,
         error: 'Workspace not found',
-        details: 'This Slack workspace is not registered with our app',
+        details: 'This Slack workspace is not registered with our app or is inactive',
       });
-      return;
     }
+
+    const workspaceContext = { id: workspace.id, slackTeamName: workspace.slackTeamName };
 
     // Get user information from Slack
     const userInfo = await getSlackUserInfo(tokenResponse.authed_user.access_token);
@@ -157,7 +212,7 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
         timezone: slackUser.tz || 'UTC',
       });
       
-      Logger.auth.userCreated(user.id, 'slack', slackUser.profile.email);
+      Logger.auth.userCreated(user.id, 'slack', slackUser.profile.email, workspaceContext);
     } else {
       // Update existing user
       user = await updateUser(user.id, {
@@ -165,7 +220,7 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
         timezone: slackUser.tz || user.timezone,
       });
       
-      Logger.auth.userUpdated(user.id, 'slack');
+      Logger.auth.userUpdated(user.id, 'slack', workspaceContext);
     }
 
     // Store Slack tokens
@@ -176,7 +231,7 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
       expiresAt: undefined, // Slack user tokens don't expire
     });
 
-    Logger.auth.tokenStored(user.id, 'slack');
+    Logger.auth.tokenStored(user.id, 'slack', workspaceContext);
 
     // Generate JWT for user session
     const jwt = await generateUserJWT(user);
@@ -192,6 +247,11 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
           id: user.id,
           email: user.email,
           slackUserId: user.slackUserId,
+          workspace: {
+            id: workspace.id,
+            name: workspace.slackTeamName,
+            teamId: workspace.slackTeamId,
+          },
         },
         redirectTo,
       });
@@ -199,6 +259,7 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
       // Redirect with token in URL (for web flow)
       const redirectUrl = new URL(redirectTo, config.server.baseUrl);
       redirectUrl.searchParams.set('token', jwt);
+      redirectUrl.searchParams.set('workspace', workspace.id);
       res.redirect(redirectUrl.toString());
     }
 
@@ -206,10 +267,7 @@ export async function handleSlackOAuthCallback(req: Request, res: Response): Pro
     console.error('Slack OAuth callback failed:', error);
     Logger.auth.oauthFailed('slack', error instanceof Error ? error.message : 'Unknown error');
     
-    res.status(500).json({
-      error: 'OAuth callback failed',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
@@ -278,13 +336,19 @@ async function generateUserJWT(user: any): Promise<string> {
 }
 
 /**
- * Revoke Slack OAuth tokens
+ * Revoke Slack OAuth tokens for the authenticated user.
  */
-export async function revokeSlackAuth(req: Request, res: Response): Promise<void> {
+/**
+ * Revoke Slack OAuth tokens for the authenticated user.
+ */
+export async function revokeSlackAuth(req: Request, res: Response, next: NextFunction) {
   try {
+    // TODO: Add authentication middleware
     if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication required' 
+      });
     }
 
     // Note: Slack doesn't provide a revoke endpoint for user tokens
@@ -292,7 +356,25 @@ export async function revokeSlackAuth(req: Request, res: Response): Promise<void
     const { deleteSlackToken } = await import('../../models/slackToken');
     await deleteSlackToken(req.user.id);
 
-    Logger.auth.tokenRevoked(req.user.id, 'slack');
+    // Get workspace context for logging
+    let workspaceContext;
+    try {
+      const { findUserById } = await import('../../models/user');
+      const user = await findUserById(req.user.id);
+      if (user?.workspaceId) {
+        const workspace = await findWorkspaceById(user.workspaceId);
+        if (workspace) {
+          workspaceContext = { 
+            id: workspace.id, 
+            slackTeamName: workspace.slackTeamName 
+          };
+        }
+      }
+    } catch (error) {
+      // Ignore error, just log without context
+    }
+
+    Logger.auth.tokenRevoked(req.user.id, 'slack', workspaceContext);
 
     res.json({
       success: true,
@@ -301,21 +383,24 @@ export async function revokeSlackAuth(req: Request, res: Response): Promise<void
 
   } catch (error) {
     console.error('Slack auth revocation failed:', error);
-    res.status(500).json({
-      error: 'Failed to revoke Slack authentication',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }
 
 /**
- * Get Slack authentication status
+ * Get Slack authentication status for the authenticated user.
  */
-export async function getSlackAuthStatus(req: Request, res: Response): Promise<void> {
+/**
+ * Get Slack authentication status for the authenticated user.
+ */
+export async function getSlackAuthStatus(req: Request, res: Response, next: NextFunction) {
   try {
+    // TODO: Add authentication middleware
     if (!req.user) {
-      res.status(401).json({ error: 'Authentication required' });
-      return;
+      return res.status(401).json({ 
+        success: false,
+        error: 'Authentication required' 
+      });
     }
 
     const { findSlackTokenByUser, isSlackTokenExpired } = await import('../../models/slackToken');
@@ -326,17 +411,17 @@ export async function getSlackAuthStatus(req: Request, res: Response): Promise<v
     const isConnected = token && !isExpired ? await checkSlackConnection(req.user.id) : false;
 
     res.json({
-      connected: !!token && !isExpired && isConnected,
-      hasToken: !!token,
-      isExpired,
-      lastUpdated: token?.updatedAt || null,
+      success: true,
+      status: {
+        connected: !!token && !isExpired && isConnected,
+        hasToken: !!token,
+        isExpired,
+        lastUpdated: token?.updatedAt || null,
+      },
     });
 
   } catch (error) {
     console.error('Slack auth status check failed:', error);
-    res.status(500).json({
-      error: 'Failed to check Slack authentication status',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    next(error);
   }
 }

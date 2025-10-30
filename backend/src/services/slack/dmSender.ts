@@ -2,11 +2,12 @@
  * Slack DM (Direct Message) sending service
  * 
  * This module provides functionality to send direct messages
- * and interactive messages to Slack users.
+ * and interactive messages to Slack users with workspace-aware token management.
  */
 
 import { WebClient, Block, KnownBlock } from '@slack/web-api';
 import { getDecryptedSlackToken } from '../../models/slackToken';
+import { findWorkspaceById } from '../../models/workspace';
 
 export interface DMMessage {
   text: string;
@@ -25,9 +26,9 @@ export interface TaskConfirmationMessage {
 }
 
 /**
- * Create Slack client for a specific user
+ * Create Slack client for a specific user (user token)
  */
-async function createSlackClient(userId: string): Promise<WebClient> {
+async function createSlackClientForUser(userId: string): Promise<WebClient> {
   const token = await getDecryptedSlackToken(userId);
   if (!token) {
     throw new Error('Slack token not found for user');
@@ -37,15 +38,33 @@ async function createSlackClient(userId: string): Promise<WebClient> {
 }
 
 /**
- * Send a direct message to a user
+ * Create Slack client for workspace operations (bot token)
+ */
+async function createSlackClientForWorkspace(workspaceId: string): Promise<WebClient> {
+  const workspace = await findWorkspaceById(workspaceId);
+  if (!workspace || !workspace.isActive) {
+    throw new Error(`Workspace not found or inactive: ${workspaceId}`);
+  }
+
+  return new WebClient(workspace.slackBotToken);
+}
+
+/**
+ * Send a direct message to a user (workspace-aware)
  */
 export async function sendDirectMessage(
-  fromUserId: string,
   toSlackUserId: string,
-  message: DMMessage
+  message: DMMessage,
+  workspaceId: string,
+  fallbackUserId?: string
 ): Promise<string> {
   try {
-    const slack = await createSlackClient(fromUserId);
+    // Use workspace bot token when possible, fall back to user token if provided
+    const slack = fallbackUserId 
+      ? await createSlackClientForUser(fallbackUserId)
+      : await createSlackClientForWorkspace(workspaceId);
+    
+    console.log(`📧 [Workspace ID: ${workspaceId}] Sending DM to user ${toSlackUserId} using ${fallbackUserId ? 'user' : 'bot'} token`);
     
     // Open a DM channel with the user
     const dmResult = await slack.conversations.open({
@@ -70,20 +89,22 @@ export async function sendDirectMessage(
       throw new Error(`Failed to send message: ${result.error}`);
     }
 
+    console.log(`📧 [Workspace ID: ${workspaceId}] Successfully sent DM to ${toSlackUserId}, message timestamp: ${result.ts}`);
     return result.ts;
   } catch (error) {
-    console.error('Failed to send direct message:', error);
+    console.error(`[Workspace ID: ${workspaceId}] Failed to send direct message:`, error);
     throw error;
   }
 }
 
 /**
- * Send task confirmation message with interactive buttons
+ * Send task confirmation message with interactive buttons (workspace-aware)
  */
 export async function sendTaskConfirmation(
-  fromUserId: string,
   toSlackUserId: string,
-  task: TaskConfirmationMessage
+  task: TaskConfirmationMessage,
+  workspaceId: string,
+  fallbackUserId?: string
 ): Promise<string> {
   try {
     const dueDateText = task.dueDate 
@@ -184,22 +205,23 @@ export async function sendTaskConfirmation(
       blocks,
     };
 
-    return await sendDirectMessage(fromUserId, toSlackUserId, message);
+    return await sendDirectMessage(toSlackUserId, message, workspaceId, fallbackUserId);
   } catch (error) {
-    console.error('Failed to send task confirmation:', error);
+    console.error(`[Workspace ID: ${workspaceId}] Failed to send task confirmation:`, error);
     throw error;
   }
 }
 
 /**
- * Send task status update message
+ * Send task status update message (workspace-aware)
  */
 export async function sendTaskStatusUpdate(
-  fromUserId: string,
   toSlackUserId: string,
   taskTitle: string,
   status: 'confirmed' | 'scheduled' | 'completed' | 'dismissed',
-  additionalInfo?: string
+  workspaceId: string,
+  additionalInfo?: string,
+  fallbackUserId?: string
 ): Promise<string> {
   const statusEmojis = {
     confirmed: '✅',
@@ -231,17 +253,18 @@ export async function sendTaskStatusUpdate(
     ],
   };
 
-  return await sendDirectMessage(fromUserId, toSlackUserId, message);
+  return await sendDirectMessage(toSlackUserId, message, workspaceId, fallbackUserId);
 }
 
 /**
- * Send error notification to user
+ * Send error notification to user (workspace-aware)
  */
 export async function sendErrorNotification(
-  fromUserId: string,
   toSlackUserId: string,
   errorMessage: string,
-  context?: string
+  workspaceId: string,
+  context?: string,
+  fallbackUserId?: string
 ): Promise<string> {
   const message: DMMessage = {
     text: `⚠️ Error: ${errorMessage}`,
@@ -256,15 +279,16 @@ export async function sendErrorNotification(
     ],
   };
 
-  return await sendDirectMessage(fromUserId, toSlackUserId, message);
+  return await sendDirectMessage(toSlackUserId, message, workspaceId, fallbackUserId);
 }
 
 /**
- * Send welcome message to new user
+ * Send welcome message to new user (workspace-aware)
  */
 export async function sendWelcomeMessage(
-  fromUserId: string,
-  toSlackUserId: string
+  toSlackUserId: string,
+  workspaceId: string,
+  fallbackUserId?: string
 ): Promise<string> {
   const message: DMMessage = {
     text: 'Welcome to Tandem! 🎉',
@@ -293,17 +317,18 @@ export async function sendWelcomeMessage(
     ],
   };
 
-  return await sendDirectMessage(fromUserId, toSlackUserId, message);
+  return await sendDirectMessage(toSlackUserId, message, workspaceId, fallbackUserId);
 }
 
 /**
- * Send calendar conflict notification
+ * Send calendar conflict notification (workspace-aware)
  */
 export async function sendCalendarConflictNotification(
-  fromUserId: string,
   toSlackUserId: string,
   taskTitle: string,
-  conflictDetails: string
+  conflictDetails: string,
+  workspaceId: string,
+  fallbackUserId?: string
 ): Promise<string> {
   const message: DMMessage = {
     text: `⚠️ Calendar conflict detected for task: ${taskTitle}`,
@@ -344,18 +369,22 @@ export async function sendCalendarConflictNotification(
     ],
   };
 
-  return await sendDirectMessage(fromUserId, toSlackUserId, message);
+  return await sendDirectMessage(toSlackUserId, message, workspaceId, fallbackUserId);
 }
 
 /**
- * Check if user has DM permissions
+ * Check if user has DM permissions (workspace-aware)
  */
 export async function canSendDM(
-  fromUserId: string,
-  toSlackUserId: string
+  toSlackUserId: string,
+  workspaceId: string,
+  fallbackUserId?: string
 ): Promise<boolean> {
   try {
-    const slack = await createSlackClient(fromUserId);
+    // Use workspace bot token when possible, fall back to user token if provided
+    const slack = fallbackUserId 
+      ? await createSlackClientForUser(fallbackUserId)
+      : await createSlackClientForWorkspace(workspaceId);
     
     const result = await slack.conversations.open({
       users: toSlackUserId,
@@ -363,7 +392,7 @@ export async function canSendDM(
 
     return result.ok === true;
   } catch (error) {
-    console.error('Failed to check DM permissions:', error);
+    console.error(`[Workspace ID: ${workspaceId}] Failed to check DM permissions:`, error);
     return false;
   }
 }

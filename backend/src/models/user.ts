@@ -180,3 +180,28 @@ export async function isUserOnboarded(id: string): Promise<boolean> {
 
   return !!(user.slackToken && user.googleToken && user.workPreferences);
 }
+
+/**
+ * Get all users in a specific workspace
+ */
+export async function getUsersByWorkspace(workspaceId: string): Promise<User[]> {
+  return await prisma.user.findMany({
+    where: { 
+      workspaceId,
+      status: 'ACTIVE',
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+}
+
+/**
+ * Get user count for a specific workspace
+ */
+export async function getUserCountByWorkspace(workspaceId: string): Promise<number> {
+  return await prisma.user.count({
+    where: { 
+      workspaceId,
+      status: 'ACTIVE',
+    },
+  });
+}
