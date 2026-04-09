@@ -8,8 +8,9 @@ build/
 
 # Environment files — never commit secrets
 .env
-.env.local
-.env.*.local
+.env.*
+**/.env
+**/.env.*
 
 # TypeScript incremental build info
 *.tsbuildinfo
@@ -26,6 +27,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Claude Code local config
+.claude/settings.json
 
 # Logs
 *.log

@@ -1,5 +1,4 @@
 // Tandem Prisma schema
-// Models and migrations will be defined here.
 
 generator client {
   provider = "prisma-client-js"
@@ -8,4 +7,168 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum TaskState {
+  detected
+  confirmed
+  scheduled
+  completed
+  dismissed
+  failed
+}
+
+enum Importance {
+  low
+  medium
+  high
+}
+
+enum DerivedUrgency {
+  low
+  medium
+  high
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model User {
+  id             String   @id @default(uuid())
+  email          String   @unique
+  password_hash  String?
+  google_id      String?  @unique
+  display_name   String
+  timezone       String   @default("UTC")
+  email_verified Boolean  @default(false)
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  tasks               Task[]
+  slack_user_tokens   SlackUserToken[]
+  google_oauth_token  GoogleOauthToken?
+  user_preferences    UserPreferences?
+  slack_installations SlackInstallation[] @relation("InstalledBy")
+  refresh_tokens      RefreshToken[]
+
+  @@map("users")
+}
+
+model SlackInstallation {
+  id                  String   @id @default(uuid())
+  slack_team_id       String   @unique
+  slack_team_name     String
+  bot_token_encrypted Bytes
+  bot_user_id         String
+  installed_by        String?
+  installed_at        DateTime @default(now())
+
+  installer         User?            @relation("InstalledBy", fields: [installed_by], references: [id])
+  slack_user_tokens SlackUserToken[]
+
+  @@map("slack_installations")
+}
+
+model SlackUserToken {
+  id                   String    @id @default(uuid())
+  user_id              String
+  installation_id      String
+  slack_user_id        String
+  user_token_encrypted Bytes
+  scopes               String
+  token_expires_at     DateTime?
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
+
+  user         User              @relation(fields: [user_id], references: [id])
+  installation SlackInstallation @relation(fields: [installation_id], references: [id])
+
+  @@unique([user_id, installation_id])
+  @@index([slack_user_id])
+  @@map("slack_user_tokens")
+}
+
+model GoogleOauthToken {
+  id                      String   @id @default(uuid())
+  user_id                 String   @unique
+  google_email            String
+  access_token_encrypted  Bytes
+  refresh_token_encrypted Bytes
+  token_expires_at        DateTime
+  calendar_id             String   @default("primary")
+  created_at              DateTime @default(now())
+  updated_at              DateTime @updatedAt
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@map("google_oauth_tokens")
+}
+
+model Task {
+  id                       String         @id @default(uuid())
+  user_id                  String
+  state                    TaskState      @default(detected)
+  title                    String
+  description              String?
+  importance               Importance     @default(medium)
+  derived_urgency          DerivedUrgency @default(medium)
+  due_date                 DateTime?
+  estimated_duration       Int
+  source_slack_team_id     String
+  source_slack_channel_id  String
+  source_slack_message_id  String
+  google_calendar_event_id String?
+  scheduled_start          DateTime?
+  scheduled_end            DateTime?
+  created_at               DateTime       @default(now())
+  updated_at               DateTime       @updatedAt
+
+  user      User           @relation(fields: [user_id], references: [id])
+  state_log TaskStateLog[]
+
+  @@index([user_id])
+  @@index([state])
+  @@map("tasks")
+}
+
+model TaskStateLog {
+  id         String     @id @default(uuid())
+  task_id    String
+  from_state TaskState?
+  to_state   TaskState
+  changed_at DateTime   @default(now())
+  metadata   Json?
+
+  task Task @relation(fields: [task_id], references: [id])
+
+  @@map("task_state_log")
+}
+
+model UserPreferences {
+  id                    String   @id @default(uuid())
+  user_id               String   @unique
+  work_hours            Json
+  break_times           Json     @default("[]")
+  default_task_duration Int      @default(30)
+  scheduling_buffer     Int      @default(0)
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@map("user_preferences")
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  user_id    String
+  token_hash String   @unique
+  expires_at DateTime
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@map("refresh_tokens")
 }

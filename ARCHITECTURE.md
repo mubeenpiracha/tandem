@@ -143,6 +143,15 @@ Graceful degradation: if OpenAI is down, tasks cannot be detected but existing s
 
 ---
 
+## Deployment
+
+- **Backend (Node.js API + Slack bot):** Railway. PostgreSQL and Redis are Railway plugins. Migrations run via `prisma migrate deploy` on each deploy.
+- **Frontend (React/Vite):** Vercel. `VITE_API_URL` env var points to the Railway backend URL.
+
+There is no local Docker infrastructure and no separate staging environment. Local development uses the Railway `DATABASE_URL` directly (stored in `packages/backend/.env`, gitignored).
+
+---
+
 ## Environment Variables
 
 All secrets live in environment variables, never in code. See `.env.example` for the full list.
