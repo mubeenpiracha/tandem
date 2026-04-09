@@ -1,0 +1,13 @@
+{
+  "name": "@tandem/shared",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --project tsconfig.json --watch",
+    "lint": "eslint src --ext .ts",
+    "type-check": "tsc --noEmit"
+  }
+}
