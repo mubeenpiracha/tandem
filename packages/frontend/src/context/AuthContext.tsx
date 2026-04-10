@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import type { AuthUser } from '@tandem/shared'
-import api from '../lib/api'
+import api, { setAuthHeader } from '../lib/api'
 
 interface AuthContextValue {
   accessToken: string | null
@@ -21,11 +21,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const restoreSession = async () => {
       try {
         const { data } = await api.post<{ accessToken: string }>('/api/auth/refresh')
+        setAuthHeader(data.accessToken)
         setAccessToken(data.accessToken)
-        const { data: me } = await api.get<AuthUser>('/api/auth/me', {
-          headers: { Authorization: `Bearer ${data.accessToken}` },
-        })
-        setUser(me)
+        const { data: me } = await api.get<{ user: AuthUser }>('/api/auth/me')
+        setUser(me.user)
       } catch {
         // No valid session — stay logged out
       } finally {
@@ -36,6 +35,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const login = (token: string, authUser: AuthUser) => {
+    setAuthHeader(token)
     setAccessToken(token)
     setUser(authUser)
   }
@@ -46,6 +46,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Proceed regardless
     }
+    setAuthHeader(null)
     setAccessToken(null)
     setUser(null)
     window.location.href = '/login'
