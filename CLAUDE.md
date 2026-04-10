@@ -43,6 +43,7 @@ Tandem is a Slack bot that detects action items in Slack messages, confirms them
 ## Security Rules — CRITICAL
 - Never log OAuth tokens, passwords, refresh tokens, or encryption keys
 - All tokens stored in DB must be encrypted using `encryptToken()` from `src/lib/crypto.ts`
+- **Password hashing uses argon2** (not bcrypt) — this is intentional. Argon2 is the PHC winner and stronger than bcrypt against GPU/side-channel attacks. Do not switch to bcrypt.
 - Never return token values in API responses — only masked indicators (e.g., `google_connected: true`)
 - Every authenticated query MUST filter by `user_id` — no exceptions
 - Input validation with Zod on every route that accepts user input
