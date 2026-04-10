@@ -22,6 +22,7 @@
     "@fastify/rate-limit": "^10.3.0",
     "@prisma/client": "^5.20.0",
     "@slack/bolt": "^3.21.0",
+    "@slack/web-api": "^7.0.0",
     "@tandem/shared": "workspace:*",
     "argon2": "^0.44.0",
     "bullmq": "^5.13.0",

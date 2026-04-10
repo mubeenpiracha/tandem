@@ -5,6 +5,7 @@ import fastifyCors from '@fastify/cors';
 import fastifyRateLimit from '@fastify/rate-limit';
 import { PrismaClient } from '@prisma/client';
 import { authRoutes } from './routes/auth.js';
+import { connectRoutes } from './routes/connect.js';
 
 // ─── Startup validation ───────────────────────────────────────────────────────
 
@@ -31,7 +32,7 @@ export async function buildApp() {
     credentials: true,
   });
 
-  await app.register(fastifyCookie);
+  await app.register(fastifyCookie, { secret: process.env.JWT_SECRET });
 
   await app.register(fastifyRateLimit, {
     max: 60,
@@ -42,6 +43,7 @@ export async function buildApp() {
   const prisma = new PrismaClient();
 
   await app.register(authRoutes, { prefix: '/api/auth', prisma });
+  await app.register(connectRoutes, { prefix: '/api/connect', prisma });
 
   app.get('/health', async () => ({ status: 'ok' }));
 
